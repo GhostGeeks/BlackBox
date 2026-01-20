@@ -1,0 +1,19 @@
+[Unit]
+Description=UAP3 Audio Player Service
+After=bluetooth.target network.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/pi/uap3-player.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
