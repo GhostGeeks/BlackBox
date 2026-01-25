@@ -207,7 +207,7 @@ def splash():
         with canvas(device) as draw:
             draw.text((0, 2), "GHOST GEEKS", fill=255)
             draw.text((0, 14), "REAL GHOST GEAR", fill=255)
-            draw.text((0, 56), "BOOTING UP THE LAB...", fill=255)
+            draw.text((0, 54), "BOOTING UP THE LAB...", fill=255)
             draw_waveform(draw, phase)
         phase += 0.15
         if time.time() - start >= SPLASH_MIN_SECONDS and get_ip():
