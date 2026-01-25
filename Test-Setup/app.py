@@ -5,6 +5,7 @@ os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
 import time
 import math
 import subprocess
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -139,17 +140,56 @@ def init_buttons():
 # =====================================================
 # MODULES
 # =====================================================
+MODULE_DIR = Path.home() / "oled" / "modules"
+
+def discover_modules(modules_root: Path):
+    mods = []
+    if not modules_root.exists():
+        return mods
+
+    for d in sorted(modules_root.iterdir()):
+        if not d.is_dir():
+            continue
+        meta_path = d / "module.json"
+        if not meta_path.exists():
+            continue
+
+        try:
+            meta = json.loads(meta_path.read_text())
+            if not meta.get("enabled", True):
+                continue
+
+            entry = meta.get("entry", "run.py")
+            entry_path = d / entry
+            if not entry_path.exists():
+                continue
+
+            mods.append(Module(
+                id=str(meta.get("id", d.name)),
+                name=str(meta.get("name", d.name)),
+                subtitle=str(meta.get("subtitle", "")),
+                entry_path=str(entry_path),
+                order=int(meta.get("order", 999)),
+            ))
+
+        except Exception:
+            continue
+
+    mods.sort(key=lambda m: (m.order, m.name.lower()))
+    return mods
+
+
 @dataclass
 class Module:
+    id: str
     name: str
     subtitle: str
-    cmd: List[str]
+    entry_path: str
+    order: int = 999
+
 
 MODULES = [
-    Module("Status", "IP / Time", ["python", str(MODULE_DIR / "status.py")]),
-    Module("ITC", "Recorder", ["python", str(MODULE_DIR / "itc.py")]),
-    Module("Ghost TV", "Camera", ["python", str(MODULE_DIR / "ghost_tv.py")]),
-    Module("Sensors", "EMF / Temp", ["python", str(MODULE_DIR / "sensors.py")]),
+   MODULES = discover_modules(MODULE_DIR)
 ]
 
 def ensure_modules():
@@ -230,7 +270,10 @@ def poweroff():
 # =====================================================
 def run_module(mod, consume, clear):
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = menu")
-    proc = subprocess.Popen(mod.cmd)
+    proc = subprocess.Popen(
+            ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
+        )
+
     while proc.poll() is None:
         if consume("back"):
             proc.terminate()
