@@ -265,55 +265,45 @@ def poweroff():
     subprocess.Popen(["sudo", "-n", "systemctl", "poweroff"])
 
 # =====================================================
-# MODULE RUNNER (stdin-controlled)
+# MODULE RUNNER
 # =====================================================
 def run_module(mod, consume, clear):
+    """
+    Runs a module as a child process and forwards button events to it via stdin.
+
+    Expected stdin commands in the module:
+      up, down, select, select_hold, back
+    """
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
-    proc = subprocess.Popen(
-        mod.cmd,
-        stdin=subprocess.PIPE,
-        text=True
-    )
+    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
 
-    while proc.poll() is None:
-        if consume("back"):
-            # Ask the module to exit cleanly
-            try:
-                proc.stdin.write("back\n")
-                proc.stdin.flush()
-            except Exception:
-                pass
-
-            # Give it a moment to shut down nicely
-            for _ in range(20):  # ~1s total
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-
-            # If still running, terminate
-            if proc.poll() is None:
-                proc.terminate()
-            break
-
-        time.sleep(0.05)
-
-    # Make sure it's not left behind
     try:
-        proc.wait(timeout=1.0)
-    except Exception:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
+        time.sleep(1.2)
+        clear()
+        return
+
+    def send(cmd_text: str):
+        """Send a single command line to the module, if it's still running."""
         try:
-            proc.kill()
+            if proc.poll() is None and proc.stdin:
+                proc.stdin.write(cmd_text + "\n")
+                proc.stdin.flush()
         except Exception:
+            # Broken pipe / module exited / stdin closed
             pass
 
-    clear()
-
-    # IMPORTANT: force redraw after returning so OLED doesn't go "dark"
-    oled_message("MODULES", ["Select a module", "", ""], "UP/DN + SELECT")
-    time.sleep(0.2)
-
-
+    # Main loop while module runs
     while proc.poll() is None:
         if consume("up"):
             send("up")
@@ -324,11 +314,11 @@ def run_module(mod, consume, clear):
         if consume("select_hold"):
             send("select_hold")
 
-        # BACK should request module exit, then fall back to terminate if needed
+        # BACK should exit the module and return to menu
         if consume("back"):
             send("back")
             # give it a moment to exit cleanly
-            for _ in range(30):  # ~1.5s
+            for _ in range(20):
                 if proc.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -338,8 +328,22 @@ def run_module(mod, consume, clear):
 
         time.sleep(0.02)
 
-    clear()
+    # Cleanup
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
 
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    clear()
 
 # =====================================================
 # SETTINGS
