@@ -1,0 +1,7 @@
+{
+  "id": "spirit_box",
+  "name": "Spirit Box",
+  "subtitle": "FM Sweep (TEA5767)",
+  "entry": "run.py",
+  "order": 20
+}
