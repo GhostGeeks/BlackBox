@@ -183,12 +183,13 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
 # Playback helpers
 # -----------------------------
 def _pick_player() -> List[str]:
+    # Force PipeWire-Pulse path for consistent routing + visibility
     if shutil.which("paplay"):
         return ["paplay", "--client-name=ghostgeeks-uap"]
+    # Fallbacks
     if shutil.which("pw-play"):
         return ["pw-play", "-q"]
     return ["aplay", "-q"]
-
 
 
 PLAYER_BASE = _pick_player()
@@ -202,7 +203,6 @@ def _wav_ready(path: Path) -> bool:
         return path.stat().st_size > 44
     except Exception:
         return False
-
 
 def start_playback(path: Path) -> Optional[subprocess.Popen]:
     """
@@ -374,8 +374,17 @@ def main():
                     playing = False
                     paused = False
                 else:
-                    playing = True
-                    paused = False
+                    # If the player dies immediately, treat it as a failure (prevents fake PLAYING state)
+                    time.sleep(0.08)
+                    if proc.poll() is not None:
+                        oled_message("UAP CALLER", ["Playback failed", "Player exited", str(OUT_WAV.name)], "BACK = exit")
+                        proc = None
+                        time.sleep(0.8)
+                        playing = False
+                        paused = False
+                    else:
+                        playing = True
+                        paused = False
 
             else:
                 # Toggle pause/resume
