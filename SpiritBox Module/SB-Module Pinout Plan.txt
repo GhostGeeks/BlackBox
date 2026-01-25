@@ -1,0 +1,32 @@
+
+Pi Zero 2W I2S Pins
+| Function                | GPIO   | Physical Pin |
+| ----------------------- | ------ | ------------ |
+| BCLK                    | GPIO18 | Pin 12       |
+| LRCLK / WS              | GPIO19 | Pin 35       |
+| I2S DATA OUT (Pi → DAC) | GPIO21 | Pin 40       |
+| I2S DATA IN (ADC → Pi)  | GPIO20 | Pin 38       |
+| 3.3V                    | —      | Pin 1        |
+| 5V                      | —      | Pin 2 or 4   |
+| GND                     | —      | Pin 6        |
+
+PCM1808 ADC Wiring
+| Function                | GPIO   | Physical Pin |
+| ----------------------- | ------ | ------------ |
+| BCLK                    | GPIO18 | Pin 12       |
+| LRCLK / WS              | GPIO19 | Pin 35       |
+| I2S DATA OUT (Pi → DAC) | GPIO21 | Pin 40       |
+| I2S DATA IN (ADC → Pi)  | GPIO20 | Pin 38       |
+| 3.3V                    | —      | Pin 1        |
+| 5V                      | —      | Pin 2 or 4   |
+| GND                     | —      | Pin 6        |
+
+PCM5102A Wiring
+| PCM1808 | Pi                              |
+| ------- | ------------------------------- |
+| BCK     | GPIO18                          |
+| LRCK    | GPIO19                          |
+| DOUT    | GPIO20                          |
+| VCC     | 3.3V *(check board silkscreen)* |
+| GND     | GND                             |
+| AIN L/R | TEA5767 audio out               |
