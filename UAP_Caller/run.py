@@ -165,11 +165,11 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
 
 def start_playback(path: Path) -> Optional[subprocess.Popen]:
     """
-    Plays WAV via aplay. We use signals for pause/resume (SIGSTOP/SIGCONT).
+    Plays WAV via pw-play. We use signals for pause/resume (SIGSTOP/SIGCONT).
     """
     try:
         return subprocess.Popen(
-            ["aplay", "-q", str(path)],
+            ["pw-play", "-q", str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
