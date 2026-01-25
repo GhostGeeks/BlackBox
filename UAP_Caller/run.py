@@ -183,14 +183,12 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
 # Playback helpers
 # -----------------------------
 def _pick_player() -> List[str]:
-    """
-    Prefer PipeWire-native pw-play, fallback to paplay, then aplay.
-    """
-    if shutil.which("pw-play"):
-        return ["pw-play", "-q"]
     if shutil.which("paplay"):
         return ["paplay", "--client-name=ghostgeeks-uap"]
+    if shutil.which("pw-play"):
+        return ["pw-play", "-q"]
     return ["aplay", "-q"]
+
 
 
 PLAYER_BASE = _pick_player()
