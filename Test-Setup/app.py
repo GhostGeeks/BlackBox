@@ -267,31 +267,52 @@ def poweroff():
 # =====================================================
 # MODULE RUNNER (stdin-controlled)
 # =====================================================
-def run_module(mod: Module, consume, clear):
-    """
-    Run a module and forward button events to it via stdin.
-    This prevents GPIO "busy" errors because ONLY app.py owns GPIO.
-    """
+def run_module(mod, consume, clear):
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
     proc = subprocess.Popen(
-        ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path],
+        mod.cmd,
         stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
+        text=True
     )
 
-    def send(msg: str):
-        try:
-            if proc.stdin and proc.poll() is None:
-                proc.stdin.write(msg + "\n")
+    while proc.poll() is None:
+        if consume("back"):
+            # Ask the module to exit cleanly
+            try:
+                proc.stdin.write("back\n")
                 proc.stdin.flush()
+            except Exception:
+                pass
+
+            # Give it a moment to shut down nicely
+            for _ in range(20):  # ~1s total
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+
+            # If still running, terminate
+            if proc.poll() is None:
+                proc.terminate()
+            break
+
+        time.sleep(0.05)
+
+    # Make sure it's not left behind
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
         except Exception:
             pass
 
     clear()
+
+    # IMPORTANT: force redraw after returning so OLED doesn't go "dark"
+    oled_message("MODULES", ["Select a module", "", ""], "UP/DN + SELECT")
+    time.sleep(0.2)
+
 
     while proc.poll() is None:
         if consume("up"):
