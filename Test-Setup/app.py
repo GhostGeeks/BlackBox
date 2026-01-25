@@ -89,7 +89,7 @@ def oled_message(title: str, lines: List[str], footer: str = ""):
             draw.text((0, y), ln[:21], fill=255)
             y += 12
         if footer:
-            draw.text((0, 56), footer[:21], fill=255)
+            draw.text((0, 54), footer[:21], fill=255)
 
 def draw_waveform(draw, phase):
     mid = 40
