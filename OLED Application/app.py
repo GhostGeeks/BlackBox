@@ -274,18 +274,38 @@ def run_module(mod, consume, clear):
     Expected stdin commands in the module:
       up, down, select, select_hold, back
     """
+    import os, subprocess, time
+
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
-    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
+    # IMPORTANT: ensure this resolves to the actual module file, e.g.
+    # /home/ghostgeeks01/oled/modules/spirit_box/run.py
+    entry = getattr(mod, "entry_path", None) or getattr(mod, "entry", None) or getattr(mod, "entry_file", None)
+    if not entry:
+        oled_message("LAUNCH FAIL", [mod.name, "No entry_path", ""], "BACK = menu")
+        time.sleep(1.2)
+        clear()
+        return
+
+    entry = str(entry)
+
+    cmd = ["/home/ghostgeeks01/oledenv/bin/python", entry]
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/home/ghostgeeks01"
+    env["GPIOZERO_PIN_FACTORY"] = "lgpio"
+    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
 
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,   # keep stderr so we can see crashes
             text=True,
             bufsize=1,
+            env=env,
         )
     except Exception as e:
         oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
@@ -294,30 +314,25 @@ def run_module(mod, consume, clear):
         return
 
     def send(cmd_text: str):
-        """Send a single command line to the module, if it's still running."""
         try:
             if proc.poll() is None and proc.stdin:
                 proc.stdin.write(cmd_text + "\n")
                 proc.stdin.flush()
         except Exception:
-            # Broken pipe / module exited / stdin closed
             pass
 
-    # Main loop while module runs
-    while proc.poll() is None:
-        if consume("up"):
-            send("up")
-        if consume("down"):
-            send("down")
-        if consume("select"):
-            send("select")
-        if consume("select_hold"):
-            send("select_hold")
+    # Read ONE event per loop (prevents "eating" events)
+    last_err_check = time.time()
 
-        # BACK should exit the module and return to menu
-        if consume("back"):
+    while proc.poll() is None:
+        ev = consume(None)  # <-- IMPORTANT: your consume() should return next event name
+        # If your consume() requires a key name, see note below.
+
+        if ev in ("up", "down", "select", "select_hold"):
+            send(ev)
+
+        if ev == "back":
             send("back")
-            # give it a moment to exit cleanly
             for _ in range(20):
                 if proc.poll() is not None:
                     break
@@ -326,12 +341,35 @@ def run_module(mod, consume, clear):
                 proc.terminate()
             break
 
+        # If module crashed, show last stderr line quickly (super helpful)
+        if time.time() - last_err_check > 0.3 and proc.stderr:
+            last_err_check = time.time()
+            try:
+                if proc.poll() is not None:
+                    break
+            except Exception:
+                pass
+
         time.sleep(0.02)
+
+    # If it exited with error, show the tail of stderr
+    try:
+        if proc.poll() not in (0, None) and proc.stderr:
+            err = proc.stderr.read()[-200:]
+            oled_message("MODULE EXIT", [mod.name, "ERR:", err.replace("\n", " ")[:18]], "BACK = menu")
+            time.sleep(1.2)
+    except Exception:
+        pass
 
     # Cleanup
     try:
         if proc.stdin:
             proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        if proc.stderr:
+            proc.stderr.close()
     except Exception:
         pass
 
