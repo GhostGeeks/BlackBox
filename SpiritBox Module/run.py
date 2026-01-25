@@ -1,428 +1,394 @@
-
 #!/usr/bin/env python3
-"""
-Ghost Geeks Spirit Box Module (TEA5767 FM)
-
-- Controlled via stdin commands from the main OLED UI:
-    up, down, select, select_hold, back
-
-- TEA5767 is I2C control, analog audio out (L/R).
-  Bluetooth audio for TEA5767 requires an audio capture device (future upgrade).
-"""
-
-import json
-import os
-import random
-import subprocess
-import sys
-import time
-from dataclasses import dataclass
+import time, json
 from pathlib import Path
-from typing import Optional
-
-# OLED (same stack you're using)
-from luma.core.interface.serial import i2c
+from gpiozero import Button
 from luma.oled.device import ssd1306
-from luma.core.render import canvas
+from luma.core.interface.serial import i2c
 
-# I2C bus access
-try:
-    from smbus2 import SMBus
-except Exception:
-    try:
-        from smbus import SMBus  # type: ignore
-    except Exception:
-        SMBus = None  # type: ignore
+from ui_common import render, draw_header, draw_row, draw_row_lr, draw_centered, LINE_H
 
-
-# =========================
+# =====================
 # CONFIG
-# =========================
-MODULE_DIR = Path(__file__).resolve().parent
-CFG_PATH = MODULE_DIR / "spirit_box_config.json"
+# =====================
+BTN_UP = 17
+BTN_DOWN = 27
+BTN_SELECT = 22
+BTN_BACK = 23
 
-I2C_BUS = 1
-TEA5767_ADDR = 0x60
+HERE = Path(__file__).resolve().parent
+SETTINGS_FILE = HERE / "settings.json"
 
-FREQ_MIN = 87.5
-FREQ_MAX = 108.0
-STEP = 0.1
-
-DWELL_MIN_MS = 50
-DWELL_MAX_MS = 350
-DWELL_STEP_MS = 50
-
-BT_TIMEOUT_SEC = 30  # pause after 30 seconds without BT (if output wants BT)
-
-OLED_W = 128
-OLED_H = 64
-
-# Display tuning: adjust baseline if needed
-Y_TOP = 0
-Y_BIG = 14
-Y_META = 46
-Y_FOOT = 56
-
-
-# =========================
-# OLED HELPERS
-# =========================
-device = ssd1306(i2c(port=I2C_BUS, address=0x3C), width=OLED_W, height=OLED_H)
-
-def draw_main(freq: float, running: bool, dwell_ms: int, style: str, out_mode: str,
-              bt_state: str, warning: str):
-    big = f"{freq:05.1f}"
-    run_txt = "RUN" if running else "STOP"
-    meta1 = f"{run_txt}  {dwell_ms}ms  {style}"
-    meta2 = f"OUT:{out_mode}  BT:{bt_state}"
-
-    with canvas(device) as d:
-        # Title
-        d.text((0, Y_TOP), "SPIRIT BOX", fill=255)
-        d.line((0, 10, 127, 10), fill=255)
-
-        # Big frequency
-        d.text((18, Y_BIG), big, fill=255)  # centered-ish for 128x64
-
-        # Meta
-        d.text((0, Y_META), meta1[:21], fill=255)
-        d.text((0, Y_META + 9), meta2[:21], fill=255)
-
-        # Warning/footer
-        if warning:
-            d.text((0, Y_FOOT), warning[:21], fill=255)
-        else:
-            d.text((0, Y_FOOT), "SEL=run  HOLD=opts  BACK=exit"[:21], fill=255)
-
-
-def draw_menu(title: str, items: list[str], idx: int, hint: str):
-    with canvas(device) as d:
-        d.text((0, 0), title[:21], fill=255)
-        d.line((0, 10, 127, 10), fill=255)
-        for i in range(4):
-            j = idx + i
-            if j >= len(items):
-                break
-            y = 12 + i * 12
-            prefix = ">" if j == idx else " "
-            d.text((0, y), (prefix + " " + items[j])[:21], fill=255)
-        d.text((0, 56), hint[:21], fill=255)
-
-
-# =========================
-# TEA5767 CONTROL
-# =========================
-@dataclass
-class Tea5767:
-    bus: object
-
-    def set_frequency(self, mhz: float):
-        """
-        Set frequency.
-
-        Common formula from TEA5767 examples:
-          PLL = 4 * ( (F_rf + IF) / F_ref )
-        IF = 225 kHz, F_ref = 32.768 kHz (watch crystal).
-        """
-        freq_hz = int(mhz * 1_000_000)
-        if_hz = 225_000
-        fref = 32_768
-
-        pll = int(4 * (freq_hz + if_hz) / fref)
-
-        # Bytes:
-        # b0: MUTE(0) | SM(0) | PLL[13:8]
-        # b1: PLL[7:0]
-        # b2: 0xB0 (example: high side LO, stereo on)
-        # b3: 0x10 (XTAL=1 -> 32.768 kHz)
-        # b4: 0x00
-        b0 = (pll >> 8) & 0x3F
-        b1 = pll & 0xFF
-        data = [b0, b1, 0xB0, 0x10, 0x00]
-
-        # write_i2c_block_data signature differs between smbus/smbus2; handle both
-        try:
-            self.bus.write_i2c_block_data(TEA5767_ADDR, data[0], data[1:])
-        except Exception:
-            # fallback: raw write
-            self.bus.write_byte_data(TEA5767_ADDR, 0x00, data[0])
-            for i, v in enumerate(data[1:], start=1):
-                self.bus.write_byte_data(TEA5767_ADDR, i, v)
-
-
-def init_radio() -> Optional[Tea5767]:
-    if SMBus is None:
-        return None
-    try:
-        b = SMBus(I2C_BUS)
-        # quick ping by attempting a frequency set
-        r = Tea5767(b)
-        r.set_frequency(99.9)
-        return r
-    except Exception:
-        return None
-
-
-# =========================
-# SETTINGS + BT DETECTION
-# =========================
-DEFAULT_CFG = {
-    "scan_style": "Random",        # Linear, PingPong, Random, Hybrid
-    "output_mode": "AUTO",         # AUTO, BT, WIRED
-    "pause_on_bt_loss": True,
-    "dwell_ms": 150
+DEFAULT_SETTINGS = {
+    "band": "FM",
+    "fm_min": 76.0,
+    "fm_max": 108.0,
+    "step_mhz": 0.1,
+    "sweep_ms": 150,
+    "scan_style": "LOOP",      # LOOP / BOUNCE / RANDOM (future)
+    "mute_behavior": "NONE"    # NONE (future expansion)
 }
 
-def load_cfg() -> dict:
-    if CFG_PATH.exists():
+# =====================
+# OLED
+# =====================
+device = ssd1306(i2c(1, 0x3C), width=128, height=64)
+
+# =====================
+# SETTINGS
+# =====================
+def load_settings():
+    if SETTINGS_FILE.exists():
         try:
-            return {**DEFAULT_CFG, **json.loads(CFG_PATH.read_text())}
+            s = json.loads(SETTINGS_FILE.read_text())
+            out = DEFAULT_SETTINGS.copy()
+            out.update(s)
+            return out
         except Exception:
-            return dict(DEFAULT_CFG)
-    return dict(DEFAULT_CFG)
+            pass
+    SETTINGS_FILE.write_text(json.dumps(DEFAULT_SETTINGS, indent=2))
+    return DEFAULT_SETTINGS.copy()
 
-def save_cfg(cfg: dict):
-    try:
-        CFG_PATH.write_text(json.dumps(cfg, indent=2))
-        os.sync()
-    except Exception:
-        pass
+def save_settings(s):
+    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
 
-def bt_connected() -> bool:
-    """
-    Connected if we can see a bluez sink.
-    This doesn't prove audio is streaming—just that the speaker is connected/available.
-    """
-    try:
-        out = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True)
-        return "bluez_output" in out
-    except Exception:
-        return False
+# =====================
+# BUTTON EVENTS (with SELECT tap vs hold)
+# =====================
+def init_buttons(hold_ms=550):
+    events = []
+    select_pressed_at = {"t": None}
 
+    def push(name):
+        events.append(name)
 
-# =========================
-# INPUT (stdin commands)
-# =========================
-def read_cmd_nonblocking() -> Optional[str]:
-    """
-    Non-blocking-ish stdin read: we poll with a tiny timeout by checking if data exists.
-    In practice your runner sends short lines; this is good enough for the module.
-    """
-    try:
-        import select
-        r, _, _ = select.select([sys.stdin], [], [], 0.0)
-        if r:
-            line = sys.stdin.readline()
-            return line.strip()
-    except Exception:
+    btn_up = Button(BTN_UP, pull_up=True, bounce_time=0.05)
+    btn_down = Button(BTN_DOWN, pull_up=True, bounce_time=0.05)
+    btn_back = Button(BTN_BACK, pull_up=True, bounce_time=0.05)
+    btn_sel = Button(BTN_SELECT, pull_up=True, bounce_time=0.03)
+
+    btn_up.when_pressed = lambda: push("up")
+    btn_down.when_pressed = lambda: push("down")
+    btn_back.when_pressed = lambda: push("back")
+
+    def sel_down():
+        select_pressed_at["t"] = time.time()
+
+    def sel_up():
+        t0 = select_pressed_at["t"]
+        select_pressed_at["t"] = None
+        if t0 is None:
+            return
+        dt = (time.time() - t0) * 1000
+        if dt >= hold_ms:
+            push("select_hold")
+        else:
+            push("select")
+
+    btn_sel.when_pressed = sel_down
+    btn_sel.when_released = sel_up
+
+    def consume():
+        if events:
+            return events.pop(0)
         return None
-    return None
 
+    return consume, (btn_up, btn_down, btn_sel, btn_back)
 
-# =========================
-# SCAN LOGIC
-# =========================
-def clamp(x, a, b):
-    return a if x < a else b if x > b else x
+# =====================
+# TEA5767 (stub for now)
+# =====================
+def tune(freq_mhz: float):
+    # TODO: implement TEA5767 I2C tune
+    # This module is scaffold-first; tuning comes next.
+    pass
 
-def next_freq_linear(cur: float) -> float:
-    n = cur + STEP
-    if n > FREQ_MAX:
-        n = FREQ_MIN
-    return round(n, 1)
+# =====================
+# UI: READY
+# =====================
+def ready_screen(settings, sel_idx):
+    menu = ["START", "SETTINGS", "BACK"]
+    def _draw(d):
+        draw_header(d, "SPIRIT BOX")
+        d.text((2, 20), f"FM {settings['fm_min']:.0f}-{settings['fm_max']:.0f} MHz", fill=255)
+        d.text((2, 30), f"Rate: {int(settings['sweep_ms'])} ms", fill=255)
+        y0 = 44
+        for i, item in enumerate(menu):
+            draw_row(d, y0 + i*10, f"{item}", selected=(i == sel_idx))
+    return menu, _draw
 
-def next_freq_pingpong(cur: float, direction: int) -> tuple[float, int]:
-    n = cur + (STEP * direction)
-    if n > FREQ_MAX:
-        n = FREQ_MAX
-        direction = -1
-    elif n < FREQ_MIN:
-        n = FREQ_MIN
-        direction = 1
-    return (round(n, 1), direction)
+# =====================
+# UI: SETTINGS LIST (FM + Rate side-by-side)
+# =====================
+def settings_overview(settings, sel_idx):
+    items = ["FM/RATE", "STEP", "SCAN", "BACK"]
 
-def next_freq_random() -> float:
-    # choose random freq on STEP grid
-    steps = int(round((FREQ_MAX - FREQ_MIN) / STEP))
-    k = random.randint(0, steps)
-    return round(FREQ_MIN + k * STEP, 1)
+    def _draw(d):
+        draw_header(d, "SETTINGS")
 
-def next_freq_hybrid(cur: float) -> float:
-    # 70% random hops, 30% linear
-    return next_freq_random() if random.random() < 0.7 else next_freq_linear(cur)
+        # Row 0: FM band + sweep rate side-by-side
+        fm_left = f"FM: {settings['fm_min']:.0f}-{settings['fm_max']:.0f}"
+        rate_right = f"{int(settings['sweep_ms'])}ms"
+        draw_row_lr(d, 20, fm_left, rate_right, selected=(sel_idx == 0), right_x=84)
 
+        # Row 1: Step
+        draw_row(d, 30, f"Step: {settings['step_mhz']:.1f} MHz", selected=(sel_idx == 1))
 
-# =========================
-# SETTINGS PAGE
-# =========================
-def settings_page(cfg: dict) -> dict:
-    items = [
-        f"Scan: {cfg['scan_style']}",
-        f"Out : {cfg['output_mode']}",
-        f"BTpause: {'ON' if cfg['pause_on_bt_loss'] else 'OFF'}",
-        "Save & Exit"
+        # Row 2: Scan style
+        draw_row(d, 40, f"Scan: {settings['scan_style']}", selected=(sel_idx == 2))
+
+        # Row 3: Back
+        draw_row(d, 50, "Back", selected=(sel_idx == 3))
+
+    return items, _draw
+
+# =====================
+# UI: EDIT MODES
+# =====================
+def edit_sweep_rate(settings, consume):
+    original = settings["sweep_ms"]
+    val = int(original)
+
+    MIN_MS, MAX_MS, STEP_MS = 50, 350, 50
+
+    blink = False
+    last_blink = time.time()
+
+    while True:
+        now = time.time()
+        if now - last_blink > 0.35:
+            blink = not blink
+            last_blink = now
+
+        def _draw(d):
+            draw_header(d, "SWEEP RATE")
+            draw_centered(d, 28, f"{val} ms", invert=blink)
+            d.text((2, 52), "UP/DN adjust", fill=255)
+            d.text((2, 62-10), "SEL save  BACK cancel", fill=255)
+
+        render(device, _draw)
+
+        ev = consume()
+        if ev == "up":
+            val = min(MAX_MS, val + STEP_MS)
+        elif ev == "down":
+            val = max(MIN_MS, val - STEP_MS)
+        elif ev == "select":
+            settings["sweep_ms"] = val
+            return settings, True
+        elif ev == "back":
+            settings["sweep_ms"] = original
+            return settings, False
+
+        time.sleep(0.03)
+
+def edit_fm_band(settings, consume):
+    # Simple edit: choose among common bands (future: per-field editing)
+    presets = [
+        (76.0, 108.0, "76–108"),
+        (87.5, 108.0, "87.5–108"),
     ]
+    cur = (settings["fm_min"], settings["fm_max"])
     idx = 0
+    for i, p in enumerate(presets):
+        if (p[0], p[1]) == cur:
+            idx = i
 
     while True:
-        items[0] = f"Scan: {cfg['scan_style']}"
-        items[1] = f"Out : {cfg['output_mode']}"
-        items[2] = f"BTpause: {'ON' if cfg['pause_on_bt_loss'] else 'OFF'}"
+        def _draw(d):
+            draw_header(d, "FM BAND")
+            d.text((2, 24), "Choose range:", fill=255)
+            for i, p in enumerate(presets):
+                draw_row(d, 34 + i*10, p[2], selected=(i == idx))
+            d.text((2, 62-10), "SEL save  BACK cancel", fill=255)
 
-        draw_menu("OPTIONS", items, idx, "UP/DN sel  SEL=chg  BACK=done")
+        render(device, _draw)
 
-        cmd = read_cmd_nonblocking()
-        if not cmd:
-            time.sleep(0.03)
-            continue
+        ev = consume()
+        if ev == "up":
+            idx = (idx - 1) % len(presets)
+        elif ev == "down":
+            idx = (idx + 1) % len(presets)
+        elif ev == "select":
+            settings["fm_min"], settings["fm_max"] = presets[idx][0], presets[idx][1]
+            return settings, True
+        elif ev == "back":
+            return settings, False
 
-        if cmd == "up":
-            idx = (idx - 1) % len(items)
-        elif cmd == "down":
-            idx = (idx + 1) % len(items)
-        elif cmd == "select":
-            if idx == 0:
-                styles = ["Linear", "PingPong", "Random", "Hybrid"]
-                curi = styles.index(cfg["scan_style"]) if cfg["scan_style"] in styles else 0
-                cfg["scan_style"] = styles[(curi + 1) % len(styles)]
-            elif idx == 1:
-                outs = ["AUTO", "BT", "WIRED"]
-                curi = outs.index(cfg["output_mode"]) if cfg["output_mode"] in outs else 0
-                cfg["output_mode"] = outs[(curi + 1) % len(outs)]
-            elif idx == 2:
-                cfg["pause_on_bt_loss"] = not cfg["pause_on_bt_loss"]
-            elif idx == 3:
-                save_cfg(cfg)
-                return cfg
-        elif cmd == "back":
-            # no save unless already saved explicitly
-            return cfg
+        time.sleep(0.03)
 
-
-# =========================
-# MAIN
-# =========================
-def main():
-    cfg = load_cfg()
-
-    radio = init_radio()
-    if radio is None:
-        # Helpful error
-        with canvas(device) as d:
-            d.text((0, 0), "SPIRIT BOX", fill=255)
-            d.text((0, 14), "No TEA5767 I2C", fill=255)
-            d.text((0, 26), "Check wiring", fill=255)
-            d.text((0, 38), "I2C enabled?", fill=255)
-            d.text((0, 56), "BACK=exit", fill=255)
-        # wait for back
-        while True:
-            cmd = read_cmd_nonblocking()
-            if cmd == "back":
-                return
-            time.sleep(0.05)
-
-    # initial state
-    freq = 99.9
-    dwell_ms = int(cfg.get("dwell_ms", 150))
-    dwell_ms = int(clamp(dwell_ms, DWELL_MIN_MS, DWELL_MAX_MS))
-
-    running = False
-    direction = 1  # for pingpong
-    bt_lost_since = None  # timestamp
-    paused_for_bt = False
-
-    # tune initial
-    try:
-        radio.set_frequency(freq)
-    except Exception:
-        pass
+def edit_scan_style(settings, consume):
+    styles = ["LOOP", "BOUNCE", "RANDOM"]
+    idx = styles.index(settings.get("scan_style", "LOOP")) if settings.get("scan_style", "LOOP") in styles else 0
 
     while True:
-        style = cfg["scan_style"]
-        out_mode = cfg["output_mode"]
+        def _draw(d):
+            draw_header(d, "SCAN STYLE")
+            for i, s in enumerate(styles):
+                draw_row(d, 24 + i*10, s, selected=(i == idx))
+            d.text((2, 62-10), "SEL save  BACK cancel", fill=255)
 
-        # BT state logic (availability)
-        bt_ok = bt_connected()
-        bt_state = "OK" if bt_ok else "OFF"
-        warning = ""
+        render(device, _draw)
 
-        wants_bt = (out_mode in ("AUTO", "BT"))
-        if wants_bt:
-            if not bt_ok:
-                if bt_lost_since is None:
-                    bt_lost_since = time.time()
-                elapsed = int(time.time() - bt_lost_since)
-                warning = f"BT LOST {elapsed:02d}s"
-                if cfg["pause_on_bt_loss"] and elapsed >= BT_TIMEOUT_SEC:
-                    running = False
-                    paused_for_bt = True
-                    warning = "BT LOST: PAUSED"
+        ev = consume()
+        if ev == "up":
+            idx = (idx - 1) % len(styles)
+        elif ev == "down":
+            idx = (idx + 1) % len(styles)
+        elif ev == "select":
+            settings["scan_style"] = styles[idx]
+            return settings, True
+        elif ev == "back":
+            return settings, False
+
+        time.sleep(0.03)
+
+# =====================
+# RUNNING: Sweep screen + hold-select to Settings
+# =====================
+def run_sweep(settings, consume):
+    freq = float(settings["fm_min"])
+    step = float(settings["step_mhz"])
+    delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
+
+    direction = 1  # for BOUNCE
+
+    while True:
+        tune(freq)
+
+        def _draw(d):
+            draw_header(d, "FM SWEEP")
+            # Big frequency presentation (centered)
+            draw_centered(d, 26, f"{freq:.1f} MHz", invert=False)
+            d.text((2, 50), f"Rate: {int(settings['sweep_ms'])}ms", fill=255)
+            d.text((2, 60), "BACK stop  HOLD=Settings", fill=255)
+
+        render(device, _draw)
+
+        ev = consume()
+        if ev == "back":
+            return  # stop sweep -> back to Ready
+        if ev == "select_hold":
+            # open settings while running (pause sweep visually)
+            settings = settings_flow(settings, consume)
+            save_settings(settings)
+            # update sweep timing if changed
+            delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
+            # continue sweeping from current freq
+
+        # Advance frequency based on scan style
+        style = settings.get("scan_style", "LOOP")
+        if style == "LOOP":
+            freq += step
+            if freq > settings["fm_max"]:
+                freq = settings["fm_min"]
+        elif style == "BOUNCE":
+            freq += step * direction
+            if freq >= settings["fm_max"]:
+                freq = settings["fm_max"]
+                direction = -1
+            elif freq <= settings["fm_min"]:
+                freq = settings["fm_min"]
+                direction = 1
+        else:  # RANDOM (simple)
+            # lightweight pseudo-random without imports
+            freq = settings["fm_min"] + ( (freq * 13.7) % (settings["fm_max"] - settings["fm_min"]) )
+
+        time.sleep(delay)
+
+# =====================
+# SETTINGS FLOW
+# =====================
+def settings_flow(settings, consume):
+    sel = 0
+    while True:
+        items, draw_fn = settings_overview(settings, sel)
+        render(device, draw_fn)
+
+        ev = consume()
+        if ev == "up":
+            sel = (sel - 1) % len(items)
+        elif ev == "down":
+            sel = (sel + 1) % len(items)
+        elif ev == "back":
+            return settings
+        elif ev == "select":
+            if sel == 0:
+                # FM/RATE row: open a mini submenu
+                settings = fm_rate_submenu(settings, consume)
+                save_settings(settings)
+            elif sel == 1:
+                # step size is locked to 0.1 for now; keep placeholder for future
+                pass
+            elif sel == 2:
+                settings, _ = edit_scan_style(settings, consume)
+                save_settings(settings)
+            elif sel == 3:
+                return settings
+
+        time.sleep(0.05)
+
+def fm_rate_submenu(settings, consume):
+    # two options: edit band, edit rate
+    opts = ["FM BAND", "SWEEP RATE", "BACK"]
+    sel = 0
+    while True:
+        def _draw(d):
+            draw_header(d, "FM / RATE")
+            for i, o in enumerate(opts):
+                draw_row(d, 24 + i*10, o, selected=(i == sel))
+            d.text((2, 62-10), "SEL choose  BACK return", fill=255)
+
+        render(device, _draw)
+
+        ev = consume()
+        if ev == "up":
+            sel = (sel - 1) % len(opts)
+        elif ev == "down":
+            sel = (sel + 1) % len(opts)
+        elif ev == "back":
+            return settings
+        elif ev == "select":
+            if sel == 0:
+                settings, _ = edit_fm_band(settings, consume)
+            elif sel == 1:
+                settings, _ = edit_sweep_rate(settings, consume)
             else:
-                bt_lost_since = None
-                if paused_for_bt:
-                    # auto resume sweep when BT returns
-                    running = True
-                    paused_for_bt = False
-        else:
-            bt_lost_since = None
-            paused_for_bt = False
+                return settings
+            save_settings(settings)
 
-        draw_main(freq, running, dwell_ms, style, out_mode, bt_state, warning)
+        time.sleep(0.05)
 
-        # handle commands
-        cmd = read_cmd_nonblocking()
-        if cmd:
-            if cmd == "back":
-                # exit module
-                with canvas(device) as d:
-                    d.text((0, 0), "SPIRIT BOX", fill=255)
-                    d.text((0, 20), "Returning...", fill=255)
-                time.sleep(0.4)
-                cfg["dwell_ms"] = dwell_ms
-                save_cfg(cfg)
+# =====================
+# MAIN
+# =====================
+def main():
+    settings = load_settings()
+    consume, _btn_refs = init_buttons()
+
+    # READY screen selection
+    sel = 0
+    while True:
+        menu, draw_fn = ready_screen(settings, sel)
+        render(device, draw_fn)
+
+        ev = consume()
+        if ev == "up":
+            sel = (sel - 1) % len(menu)
+        elif ev == "down":
+            sel = (sel + 1) % len(menu)
+        elif ev == "back":
+            return
+        elif ev == "select":
+            if menu[sel] == "START":
+                run_sweep(settings, consume)
+                settings = load_settings()  # refresh in case changed during run
+            elif menu[sel] == "SETTINGS":
+                settings = settings_flow(settings, consume)
+                save_settings(settings)
+            else:
                 return
 
-            elif cmd == "select":
-                running = not running
-                paused_for_bt = False  # user override
-
-            elif cmd == "up":
-                dwell_ms = int(clamp(dwell_ms - DWELL_STEP_MS, DWELL_MIN_MS, DWELL_MAX_MS))
-                cfg["dwell_ms"] = dwell_ms
-                save_cfg(cfg)
-
-            elif cmd == "down":
-                dwell_ms = int(clamp(dwell_ms + DWELL_STEP_MS, DWELL_MIN_MS, DWELL_MAX_MS))
-                cfg["dwell_ms"] = dwell_ms
-                save_cfg(cfg)
-
-            elif cmd == "select_hold":
-                cfg["dwell_ms"] = dwell_ms
-                cfg = settings_page(cfg)
-                # apply persisted dwell if changed
-                dwell_ms = int(clamp(int(cfg.get("dwell_ms", dwell_ms)), DWELL_MIN_MS, DWELL_MAX_MS))
-
-        # scan tick
-        if running:
-            if style == "Linear":
-                freq = next_freq_linear(freq)
-            elif style == "PingPong":
-                freq, direction = next_freq_pingpong(freq, direction)
-            elif style == "Random":
-                freq = next_freq_random()
-            else:  # Hybrid
-                freq = next_freq_hybrid(freq)
-
-            try:
-                radio.set_frequency(freq)
-            except Exception:
-                # if tuning fails, stop to avoid runaway loop
-                running = False
-
-            time.sleep(dwell_ms / 1000.0)
-        else:
-            time.sleep(0.03)
-
+        time.sleep(0.05)
 
 if __name__ == "__main__":
     main()
