@@ -340,8 +340,6 @@ def run_module(mod, consume, clear):
             text=True,
             bufsize=1,
         )
-
-
     except Exception as e:
         oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
         time.sleep(1.2)
@@ -355,9 +353,8 @@ def run_module(mod, consume, clear):
                 proc.stdin.write(cmd_text + "\n")
                 proc.stdin.flush()
         except Exception:
-            pass  # module exited / stdin closed
+            pass
 
-    # Main loop while module runs
     while proc.poll() is None:
         if consume("up"):
             send("up")
@@ -369,16 +366,14 @@ def run_module(mod, consume, clear):
             send("select_hold")
 
         if consume("back"):
-            # Tell module to go "back". Module should exit when appropriate.
             send("back")
 
-            # Give it a moment to exit cleanly
+            # allow graceful exit
             for _ in range(30):
                 if proc.poll() is not None:
                     break
                 time.sleep(0.02)
 
-            # If it didn't exit, terminate it (safety)
             if proc.poll() is None:
                 try:
                     proc.terminate()
@@ -388,7 +383,6 @@ def run_module(mod, consume, clear):
 
         time.sleep(0.02)
 
-    # Cleanup process handles
     try:
         if proc.stdin:
             proc.stdin.close()
@@ -403,7 +397,7 @@ def run_module(mod, consume, clear):
         except Exception:
             pass
 
-    # ---- IMPORTANT: clear & drain lingering button events so menu doesn't "ghost back" ----
+    # Clear & drain queued button events so menu doesn't "ghost"
     clear()
     time.sleep(0.08)
     clear()
@@ -417,9 +411,7 @@ def run_module(mod, consume, clear):
         consume("back")
         time.sleep(0.01)
 
-    # ---- IMPORTANT: re-init OLED in case module left it off/blank ----
     oled_hard_wake()
-
 
 # =====================================================
 # MAIN
