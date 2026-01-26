@@ -319,6 +319,7 @@ def settings(consume, clear):
 # =====================================================
 # MODULE RUNNER (critical: wake OLED after child exits)
 # =====================================================
+
 def run_module(mod: Module, consume, clear):
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
@@ -335,17 +336,29 @@ def run_module(mod: Module, consume, clear):
         time.sleep(0.05)
 
     # Let the child exit fully
-    for _ in range(30):
+    for _ in range(40):
         if proc.poll() is not None:
             break
         time.sleep(0.01)
 
+    # ---- KEY FIX: flush any lingering button events / bounce ----
+    clear()
+    time.sleep(0.08)
     clear()
 
-    # *** THE FIX ***
-    # If the module left the OLED in a blank/off state, re-init it.
-    oled_hard_wake()
+    # Drain any queued events for a short window (prevents "ghost back")
+    drain_until = time.time() + 0.20
+    while time.time() < drain_until:
+        # consume clears flags if they were set by gpiozero callbacks
+        consume("up")
+        consume("down")
+        consume("select")
+        consume("select_hold")
+        consume("back")
+        time.sleep(0.01)
 
+    # Wake OLED in case module turned it off / left bus weird
+    oled_hard_wake()
 
 # =====================================================
 # MAIN
