@@ -15,6 +15,7 @@ from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 from luma.core.render import canvas
 
+
 # =====================================================
 # CONFIG
 # =====================================================
@@ -41,20 +42,19 @@ SD_TEST_FILE = APP_DIR / ".sd_write_test"
 SPLASH_MIN_SECONDS = 5.0
 SPLASH_FRAME_SLEEP = 0.08
 
+
 # =====================================================
 # OLED
 # =====================================================
 serial = i2c(port=I2C_PORT, address=I2C_ADDR)
 device = ssd1306(serial, width=OLED_W, height=OLED_H)
 
+
 # =====================================================
 # UTILITIES
 # =====================================================
 def sd_write_check() -> Optional[str]:
-    """
-    Confirm we can write to the filesystem.
-    If this fails, something is seriously wrong (read-only fs, bad mount, etc.)
-    """
+    """Confirm we can write to the filesystem."""
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         SD_TEST_FILE.write_text("ok\n")
@@ -88,7 +88,6 @@ def oled_message(title: str, lines: List[str], footer: str = ""):
             draw.text((0, y), ln[:21], fill=255)
             y += 12
         if footer:
-            # lift footer slightly so it never clips
             draw.text((0, 54), footer[:21], fill=255)
 
 def draw_waveform(draw, phase):
@@ -101,6 +100,7 @@ def draw_waveform(draw, phase):
         pts.append((4 + x, int(mid - y * amp)))
     draw.rectangle((2, 26, 125, 53), outline=255)
     draw.line(pts, fill=255)
+
 
 # =====================================================
 # BUTTONS
@@ -143,8 +143,8 @@ def init_buttons():
         for k in events:
             events[k] = False
 
-    # return button objects so they stay alive
     return consume, clear, (btn_up, btn_down, btn_select, btn_back)
+
 
 # =====================================================
 # MODULES
@@ -158,9 +158,6 @@ class Module:
     order: int = 999
 
 def ensure_modules_dir():
-    """
-    Modules live under ~/oled/modules/<module_id> with module.json + run.py
-    """
     MODULE_DIR.mkdir(parents=True, exist_ok=True)
 
 def discover_modules(modules_root: Path) -> List[Module]:
@@ -196,11 +193,11 @@ def discover_modules(modules_root: Path) -> List[Module]:
                 )
             )
         except Exception:
-            # bad module shouldn't kill UI
             continue
 
     mods.sort(key=lambda m: (m.order, m.name.lower()))
     return mods
+
 
 # =====================================================
 # UI SCREENS
@@ -238,6 +235,7 @@ def draw_menu(mods: List[Module], idx: int):
 
         draw.text((0, 54), "SEL run  HOLD=cfg", fill=255)
 
+
 # =====================================================
 # POWER CONFIRM
 # =====================================================
@@ -264,22 +262,12 @@ def poweroff():
     oled_message("POWEROFF", ["Shutting down...", "", ""])
     subprocess.Popen(["sudo", "-n", "systemctl", "poweroff"])
 
+
 # =====================================================
 # MODULE RUNNER
 # =====================================================
 def run_module(mod, consume, clear, redraw_menu=None):
-    """
-    Runs a module as a child process and forwards button events to it via stdin.
-
-    Expected stdin commands in the module:
-      up, down, select, select_hold, back
-
-    BACK handling:
-      - Forwarded to module for normal navigation.
-      - Double-tap BACK quickly (within 1s) to force-kill a stuck module.
-    """
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = nav/exit")
-
     cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
 
     try:
@@ -287,7 +275,7 @@ def run_module(mod, consume, clear, redraw_menu=None):
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,   # IMPORTANT: avoid PIPE deadlocks
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
             env=os.environ.copy(),
@@ -310,14 +298,11 @@ def run_module(mod, consume, clear, redraw_menu=None):
 
     back_force_deadline = 0.0
 
-    # Run loop (keep it tight; never block for long)
     while True:
-        rc = proc.poll()
-        if rc is not None:
+        if proc.poll() is not None:
             break
 
         ev = None
-        # Consume only one event per tick so we don't backlog
         for key in ("up", "down", "select", "select_hold", "back"):
             if consume(key):
                 ev = key
@@ -325,11 +310,9 @@ def run_module(mod, consume, clear, redraw_menu=None):
 
         if ev:
             send(ev)
-
             if ev == "back":
                 now = time.time()
                 if now < back_force_deadline:
-                    # force kill
                     try:
                         proc.terminate()
                     except Exception:
@@ -339,9 +322,8 @@ def run_module(mod, consume, clear, redraw_menu=None):
 
         time.sleep(0.02)
 
-    # Clean shutdown without UI freeze:
-    # give it a short moment to exit; then kill if needed
-    for _ in range(20):  # ~0.4s total
+    # Small grace period
+    for _ in range(20):
         if proc.poll() is not None:
             break
         time.sleep(0.02)
@@ -352,29 +334,28 @@ def run_module(mod, consume, clear, redraw_menu=None):
         except Exception:
             pass
 
-    # Close stdin to release resources
     try:
         if proc.stdin:
             proc.stdin.close()
     except Exception:
         pass
 
-    # Do NOT block long on wait()
     try:
         proc.wait(timeout=0.2)
     except Exception:
         pass
 
-    # IMPORTANT: flush any queued button presses that happened during exit
+    # Flush queued events from module exit / button mash
     clear()
 
-    # IMPORTANT: force redraw NOW so menu doesn't "wake up later"
+    # Force redraw immediately (this is the key!)
     if redraw_menu:
         redraw_menu()
+        time.sleep(0.05)
     else:
-        # fallback: at least draw something
         oled_message("GHOST GEEKS", ["Returning...", "", ""], "")
         time.sleep(0.1)
+
 
 # =====================================================
 # SETTINGS SCREEN
@@ -391,6 +372,7 @@ def settings_screen(consume, clear):
             clear()
             return
         time.sleep(0.1)
+
 
 # =====================================================
 # MAIN
@@ -414,18 +396,29 @@ def main():
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
-    draw_menu(modules, idx)
+
+    # Dirty flag ensures we repaint after module returns (even without input)
+    dirty = True
+    last_draw = 0.0
 
     back_pressed_at = None
 
     while True:
+        now = time.time()
+
+        # Watchdog redraw: never let screen stay blank
+        if dirty or (now - last_draw) > 1.5:
+            draw_menu(modules, idx)
+            last_draw = now
+            dirty = False
+
         if consume("up"):
             idx = (idx - 1) % len(modules)
-            draw_menu(modules, idx)
+            dirty = True
 
         if consume("down"):
             idx = (idx + 1) % len(modules)
-            draw_menu(modules, idx)
+            dirty = True
 
         if consume("select"):
             if modules[idx].id != "none":
@@ -434,13 +427,13 @@ def main():
                     consume,
                     clear,
                     redraw_menu=lambda: draw_menu(modules, idx)
-)
-# draw_menu is already called by redraw_menu; no need to call again here
-
+                )
+            # After returning from any module, force a repaint in parent loop
+            dirty = True
 
         if consume("select_hold"):
             settings_screen(consume, clear)
-            draw_menu(modules, idx)
+            dirty = True
 
         # BACK holds (reboot/poweroff)
         if btn_back.is_pressed:
@@ -453,16 +446,19 @@ def main():
                     poweroff()
                     return
                 back_pressed_at = None
+                dirty = True
 
             elif held >= BACK_REBOOT_HOLD:
                 if confirm_action("REBOOT?", consume, clear):
                     reboot()
                     return
                 back_pressed_at = None
+                dirty = True
         else:
             back_pressed_at = None
 
         time.sleep(0.02)
+
 
 if __name__ == "__main__":
     main()
