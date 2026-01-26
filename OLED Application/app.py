@@ -52,13 +52,12 @@ device = ssd1306(serial, width=OLED_W, height=OLED_H)
 # =====================================================
 def sd_write_check() -> Optional[str]:
     """
-    Basic check to confirm we can write to the filesystem.
+    Confirm we can write to the filesystem.
     If this fails, something is seriously wrong (read-only fs, bad mount, etc.)
     """
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         SD_TEST_FILE.write_text("ok\n")
-        # Python <3.8 doesn't support missing_ok; you are on newer so it's fine.
         SD_TEST_FILE.unlink(missing_ok=True)
         return None
     except Exception as e:
@@ -89,6 +88,7 @@ def oled_message(title: str, lines: List[str], footer: str = ""):
             draw.text((0, y), ln[:21], fill=255)
             y += 12
         if footer:
+            # lift footer slightly so it never clips
             draw.text((0, 54), footer[:21], fill=255)
 
 def draw_waveform(draw, phase):
@@ -117,7 +117,12 @@ def init_buttons():
     btn_up = Button(BTN_UP, pull_up=True, bounce_time=0.06)
     btn_down = Button(BTN_DOWN, pull_up=True, bounce_time=0.06)
 
-    btn_select = Button(BTN_SELECT, pull_up=True, bounce_time=0.06, hold_time=SELECT_HOLD_SECONDS)
+    btn_select = Button(
+        BTN_SELECT,
+        pull_up=True,
+        bounce_time=0.06,
+        hold_time=SELECT_HOLD_SECONDS
+    )
     btn_back = Button(BTN_BACK, pull_up=True, bounce_time=0.06)
 
     btn_up.when_pressed = lambda: events.__setitem__("up", True)
@@ -129,7 +134,7 @@ def init_buttons():
     btn_back.when_pressed = lambda: events.__setitem__("back", True)
 
     def consume(k):
-        if events[k]:
+        if events.get(k):
             events[k] = False
             return True
         return False
@@ -138,7 +143,7 @@ def init_buttons():
         for k in events:
             events[k] = False
 
-    # IMPORTANT: return button objects so they stay alive
+    # return button objects so they stay alive
     return consume, clear, (btn_up, btn_down, btn_select, btn_back)
 
 # =====================================================
@@ -151,12 +156,10 @@ class Module:
     subtitle: str
     entry_path: str
     order: int = 999
-    back_armed_until = 0.0 
-    
+
 def ensure_modules_dir():
     """
-    New world: modules live under ~/oled/modules/<module_id> with module.json + run.py
-    We only ensure the directory exists; we do NOT auto-generate legacy scripts.
+    Modules live under ~/oled/modules/<module_id> with module.json + run.py
     """
     MODULE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -175,7 +178,6 @@ def discover_modules(modules_root: Path) -> List[Module]:
 
         try:
             meta = json.loads(meta_path.read_text())
-
             if not meta.get("enabled", True):
                 continue
 
@@ -184,15 +186,17 @@ def discover_modules(modules_root: Path) -> List[Module]:
             if not entry_path.exists():
                 continue
 
-            mods.append(Module(
-                id=str(meta.get("id", d.name)),
-                name=str(meta.get("name", d.name)),
-                subtitle=str(meta.get("subtitle", "")),
-                entry_path=str(entry_path),
-                order=int(meta.get("order", 999)),
-            ))
+            mods.append(
+                Module(
+                    id=str(meta.get("id", d.name)),
+                    name=str(meta.get("name", d.name)),
+                    subtitle=str(meta.get("subtitle", "")),
+                    entry_path=str(entry_path),
+                    order=int(meta.get("order", 999)),
+                )
+            )
         except Exception:
-            # Ignore bad module entries so one broken module doesn't kill the UI
+            # bad module shouldn't kill UI
             continue
 
     mods.sort(key=lambda m: (m.order, m.name.lower()))
@@ -220,14 +224,9 @@ def draw_menu(mods: List[Module], idx: int):
         draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
         draw.line((0, 12, 127, 12), fill=255)
 
-        # Fit as many items as we can
-        max_rows = 4  # 16, 28, 40, 52 (but last row conflicts with footer; we use 3 + footer)
-        # We'll show up to 3 items plus footer to keep it clean
         visible_rows = 3
-
         start_i = 0
         if len(mods) > visible_rows:
-            # scroll window so the selection stays visible
             start_i = max(0, min(idx - 1, len(mods) - visible_rows))
 
         for row in range(visible_rows):
@@ -268,33 +267,32 @@ def poweroff():
 # =====================================================
 # MODULE RUNNER
 # =====================================================
-def run_module(mod, consume, clear):
+def run_module(mod: Module, consume, clear):
     """
-    Runs a module as a child process and forwards button events to it via stdin.
+    Runs a module as a child process and forwards button events via stdin.
 
     Expected stdin commands in the module:
       up, down, select, select_hold, back
+
+    IMPORTANT:
+      - BACK is forwarded to the module (navigation).
+      - Module decides whether BACK exits.
+      - Safety hatch: double-tap BACK quickly force-quits the module.
     """
-    import os
-    import subprocess
-    import time
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = nav/exit")
 
-    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
-
-    # mod.entry_path should be a full path string to the module entry file
-    entry = getattr(mod, "entry_path", None) or getattr(mod, "entry", None)
+    entry = mod.entry_path
     if not entry:
         oled_message("LAUNCH FAIL", [mod.name, "Missing entry", ""], "BACK = menu")
         time.sleep(1.2)
         clear()
         return
 
-    cmd = ["/home/ghostgeeks01/oledenv/bin/python", str(entry)]
+    cmd = [str(HOME / "oledenv" / "bin" / "python"), str(entry)]
 
-    # Ensure modules can import shared code like "oled.ui_common"
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/home/ghostgeeks01"
-    env["GPIOZERO_PIN_FACTORY"] = "lgpio"
+    env["PYTHONPATH"] = str(HOME)          # lets modules import oled.*
+    env["GPIOZERO_PIN_FACTORY"] = "lgpio"  # consistent with service
     env["XDG_RUNTIME_DIR"] = "/run/user/1000"
     env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
 
@@ -303,7 +301,7 @@ def run_module(mod, consume, clear):
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,   # keep stderr so we can see crashes
+            stderr=subprocess.PIPE,  # keep for crash hint
             text=True,
             bufsize=1,
             env=env,
@@ -315,7 +313,6 @@ def run_module(mod, consume, clear):
         return
 
     def send(line: str):
-        """Send a single line to the module's stdin if it's still alive."""
         try:
             if proc.poll() is None and proc.stdin:
                 proc.stdin.write(line + "\n")
@@ -323,7 +320,7 @@ def run_module(mod, consume, clear):
         except Exception:
             pass
 
-    # Main loop: forward exactly ONE event per tick (prevents over-sending)
+    back_armed_until = 0.0
     order = ("up", "down", "select", "select_hold", "back")
 
     while proc.poll() is None:
@@ -337,28 +334,26 @@ def run_module(mod, consume, clear):
             send(ev)
 
             if ev == "back":
-                # Give module a moment to exit cleanly
-                for _ in range(20):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.05)
-                if proc.poll() is None:
+                # Safety hatch: tap BACK twice quickly to force-exit a stuck module
+                now = time.time()
+                if now < back_armed_until:
                     proc.terminate()
-                break
+                    break
+                back_armed_until = now + 1.0
 
         time.sleep(0.02)
 
-    # If module exited with an error, show a short hint on OLED
+    # show crash hint if non-zero exit
     try:
         rc = proc.poll()
         if rc not in (0, None) and proc.stderr:
-            tail = proc.stderr.read()[-300:].replace("\n", " ")
+            tail = proc.stderr.read()[-350:].replace("\n", " ")
             oled_message("MODULE CRASH", [mod.name, tail[:21], tail[21:42]], "BACK = menu")
             time.sleep(1.6)
     except Exception:
         pass
 
-    # Cleanup
+    # cleanup
     try:
         if proc.stdin:
             proc.stdin.close()
@@ -381,9 +376,9 @@ def run_module(mod, consume, clear):
     clear()
 
 # =====================================================
-# SETTINGS
+# SETTINGS SCREEN
 # =====================================================
-def settings(consume, clear):
+def settings_screen(consume, clear):
     clear()
     while True:
         oled_message(
@@ -400,7 +395,8 @@ def settings(consume, clear):
 # MAIN
 # =====================================================
 def main():
-    if err := sd_write_check():
+    err = sd_write_check()
+    if err:
         oled_message("SD ERROR", [err[:21]], "")
         while True:
             time.sleep(1)
@@ -414,7 +410,6 @@ def main():
     modules = discover_modules(MODULE_DIR)
     if not modules:
         oled_message("NO MODULES", ["Add modules under", "~/oled/modules", ""], "HOLD=cfg")
-        # Still allow settings and power holds
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
@@ -432,16 +427,15 @@ def main():
             draw_menu(modules, idx)
 
         if consume("select"):
-            # ignore the dummy item
             if modules[idx].id != "none":
                 run_module(modules[idx], consume, clear)
             draw_menu(modules, idx)
 
         if consume("select_hold"):
-            settings(consume, clear)
+            settings_screen(consume, clear)
             draw_menu(modules, idx)
 
-        # BACK holds
+        # BACK holds (reboot/poweroff)
         if btn_back.is_pressed:
             if back_pressed_at is None:
                 back_pressed_at = time.time()
