@@ -255,6 +255,10 @@ def settings_flow(settings):
     sel = 0
     while True:
         items, draw_fn = screen_settings(settings, sel)
+         # SAFETY: clamp sel in case something changed
+        if sel >= len(items):
+            sel = 0
+        
         render(device, draw_fn)
 
         ev = read_event()
