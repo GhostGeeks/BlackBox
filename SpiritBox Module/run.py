@@ -92,13 +92,12 @@ def screen_ready(settings, sel_idx):
     return menu, _draw
 
 def screen_settings(settings, sel_idx):
-    # No "BACK" selection item — BACK is a hardware button
+    # BACK is hardware button; don't include it as a selectable row
     items = ["FM/RATE", "STEP", "SCAN"]
 
     def _draw(d):
         draw_header(d, "SETTINGS")
 
-        # Side-by-side row (FM band + sweep rate)
         fm_left = f"FM: {settings['fm_min']:.0f}-{settings['fm_max']:.0f}"
         rate_right = f"{int(settings['sweep_ms'])}ms"
         draw_row_lr(d, 20, fm_left, rate_right, selected=(sel_idx == 0), right_x=84)
@@ -106,7 +105,7 @@ def screen_settings(settings, sel_idx):
         draw_row(d, 30, f"Step: {settings['step_mhz']:.1f} MHz", selected=(sel_idx == 1))
         draw_row(d, 40, f"Scan: {settings['scan_style']}", selected=(sel_idx == 2))
 
-        # One hint line only
+        # Hint line
         d.text((2, 60), "SEL choose   BACK return", fill=255)
 
     return items, _draw
@@ -252,13 +251,15 @@ def fm_rate_submenu(settings):
         time.sleep(0.05)
 
 def settings_flow(settings):
-    sel = 0
+    sel = 0  # reset every time we enter settings
+
     while True:
         items, draw_fn = screen_settings(settings, sel)
-         # SAFETY: clamp sel in case something changed
-        if sel >= len(items):
+
+        # SAFETY: keep sel always in-range
+        if sel < 0 or sel >= len(items):
             sel = 0
-        
+
         render(device, draw_fn)
 
         ev = read_event()
@@ -268,16 +269,17 @@ def settings_flow(settings):
             sel = (sel + 1) % len(items)
         elif ev == "back":
             return settings
-               elif ev == "select":
+        elif ev == "select":
             if sel == 0:
                 settings = fm_rate_submenu(settings)
+                save_settings(settings)
             elif sel == 1:
-                # Step size locked for now (0.1); future edit hook here
+                # Step editing hook (optional later)
                 pass
             elif sel == 2:
-                settings, _ = edit_scan_style(settings)
-                save_settings(settings)
-
+                settings, changed = edit_scan_style(settings)
+                if changed:
+                    save_settings(settings)
 
         time.sleep(0.05)
 
