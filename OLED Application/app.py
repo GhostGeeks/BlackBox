@@ -44,17 +44,37 @@ SPLASH_FRAME_SLEEP = 0.08
 
 
 # =====================================================
-# OLED
+# OLED (re-init safe)
 # =====================================================
-serial = i2c(port=I2C_PORT, address=I2C_ADDR)
-device = ssd1306(serial, width=OLED_W, height=OLED_H)
+_serial = None
+device = None
+
+def oled_init():
+    """(Re)initialize the OLED. Call this after modules exit to avoid 'black screen'."""
+    global _serial, device
+    _serial = i2c(port=I2C_PORT, address=I2C_ADDR)
+    device = ssd1306(_serial, width=OLED_W, height=OLED_H)
+
+def oled_hard_wake():
+    """
+    Some child processes leave the SSD1306 in DISPLAYOFF or similar state.
+    Re-init fixes it reliably.
+    """
+    try:
+        oled_init()
+    except Exception:
+        # If I2C is momentarily busy, give it a beat and retry once.
+        time.sleep(0.05)
+        oled_init()
+
+# Initialize once at startup
+oled_init()
 
 
 # =====================================================
 # UTILITIES
 # =====================================================
 def sd_write_check() -> Optional[str]:
-    """Confirm we can write to the filesystem."""
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         SD_TEST_FILE.write_text("ok\n")
@@ -79,7 +99,15 @@ def hostname() -> str:
 def uptime_short() -> str:
     return subprocess.getoutput("uptime -p").replace("up ", "").strip()
 
+
+# =====================================================
+# OLED DRAW HELPERS
+# =====================================================
 def oled_message(title: str, lines: List[str], footer: str = ""):
+    # Make sure device exists (re-init safe)
+    if device is None:
+        oled_hard_wake()
+
     with canvas(device) as draw:
         draw.text((0, 0), title[:21], fill=255)
         draw.line((0, 12, 127, 12), fill=255)
@@ -206,17 +234,25 @@ def splash():
     start = time.time()
     phase = 0.0
     while True:
+        if device is None:
+            oled_hard_wake()
+
         with canvas(device) as draw:
             draw.text((0, 2), "GHOST GEEKS", fill=255)
             draw.text((0, 14), "REAL GHOST GEAR", fill=255)
             draw.text((0, 54), "BOOTING UP THE LAB...", fill=255)
             draw_waveform(draw, phase)
+
         phase += 0.15
-        if time.time() - start >= SPLASH_MIN_SECONDS and get_ip():
+        if (time.time() - start) >= SPLASH_MIN_SECONDS and get_ip():
             return
         time.sleep(SPLASH_FRAME_SLEEP)
 
 def draw_menu(mods: List[Module], idx: int):
+    # Re-init-safe: if a module shut the display off, wake it first
+    if device is None:
+        oled_hard_wake()
+
     with canvas(device) as draw:
         draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
         draw.line((0, 12, 127, 12), fill=255)
@@ -264,103 +300,9 @@ def poweroff():
 
 
 # =====================================================
-# MODULE RUNNER
+# SETTINGS
 # =====================================================
-def run_module(mod, consume, clear, redraw_menu=None):
-    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = nav/exit")
-    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-            env=os.environ.copy(),
-        )
-    except Exception as e:
-        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
-        time.sleep(1.2)
-        clear()
-        if redraw_menu:
-            redraw_menu()
-        return
-
-    def send(cmd_text: str):
-        try:
-            if proc.poll() is None and proc.stdin:
-                proc.stdin.write(cmd_text + "\n")
-                proc.stdin.flush()
-        except Exception:
-            pass
-
-    back_force_deadline = 0.0
-
-    while True:
-        if proc.poll() is not None:
-            break
-
-        ev = None
-        for key in ("up", "down", "select", "select_hold", "back"):
-            if consume(key):
-                ev = key
-                break
-
-        if ev:
-            send(ev)
-            if ev == "back":
-                now = time.time()
-                if now < back_force_deadline:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                    break
-                back_force_deadline = now + 1.0
-
-        time.sleep(0.02)
-
-    # Small grace period
-    for _ in range(20):
-        if proc.poll() is not None:
-            break
-        time.sleep(0.02)
-
-    if proc.poll() is None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-    try:
-        if proc.stdin:
-            proc.stdin.close()
-    except Exception:
-        pass
-
-    try:
-        proc.wait(timeout=0.2)
-    except Exception:
-        pass
-
-    # Flush queued events from module exit / button mash
-    clear()
-
-    # Force redraw immediately (this is the key!)
-    if redraw_menu:
-        redraw_menu()
-        time.sleep(0.05)
-    else:
-        oled_message("GHOST GEEKS", ["Returning...", "", ""], "")
-        time.sleep(0.1)
-
-
-# =====================================================
-# SETTINGS SCREEN
-# =====================================================
-def settings_screen(consume, clear):
+def settings(consume, clear):
     clear()
     while True:
         oled_message(
@@ -375,11 +317,41 @@ def settings_screen(consume, clear):
 
 
 # =====================================================
+# MODULE RUNNER (critical: wake OLED after child exits)
+# =====================================================
+def run_module(mod: Module, consume, clear):
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
+
+    proc = subprocess.Popen(
+        ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    while proc.poll() is None:
+        if consume("back"):
+            proc.terminate()
+            break
+        time.sleep(0.05)
+
+    # Let the child exit fully
+    for _ in range(30):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.01)
+
+    clear()
+
+    # *** THE FIX ***
+    # If the module left the OLED in a blank/off state, re-init it.
+    oled_hard_wake()
+
+
+# =====================================================
 # MAIN
 # =====================================================
 def main():
-    err = sd_write_check()
-    if err:
+    if err := sd_write_check():
         oled_message("SD ERROR", [err[:21]], "")
         while True:
             time.sleep(1)
@@ -396,46 +368,30 @@ def main():
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
-
-    # Dirty flag ensures we repaint after module returns (even without input)
-    dirty = True
-    last_draw = 0.0
+    draw_menu(modules, idx)
 
     back_pressed_at = None
 
     while True:
-        now = time.time()
-
-        # Watchdog redraw: never let screen stay blank
-        if dirty or (now - last_draw) > 1.5:
-            draw_menu(modules, idx)
-            last_draw = now
-            dirty = False
-
         if consume("up"):
             idx = (idx - 1) % len(modules)
-            dirty = True
+            draw_menu(modules, idx)
 
         if consume("down"):
             idx = (idx + 1) % len(modules)
-            dirty = True
+            draw_menu(modules, idx)
 
         if consume("select"):
             if modules[idx].id != "none":
-                run_module(
-                    modules[idx],
-                    consume,
-                    clear,
-                    redraw_menu=lambda: draw_menu(modules, idx)
-                )
-            # After returning from any module, force a repaint in parent loop
-            dirty = True
+                run_module(modules[idx], consume, clear)
+            # Always redraw menu after returning (and after OLED wake)
+            draw_menu(modules, idx)
 
         if consume("select_hold"):
-            settings_screen(consume, clear)
-            dirty = True
+            settings(consume, clear)
+            draw_menu(modules, idx)
 
-        # BACK holds (reboot/poweroff)
+        # BACK holds
         if btn_back.is_pressed:
             if back_pressed_at is None:
                 back_pressed_at = time.time()
@@ -446,19 +402,18 @@ def main():
                     poweroff()
                     return
                 back_pressed_at = None
-                dirty = True
+                draw_menu(modules, idx)
 
             elif held >= BACK_REBOOT_HOLD:
                 if confirm_action("REBOOT?", consume, clear):
                     reboot()
                     return
                 back_pressed_at = None
-                dirty = True
+                draw_menu(modules, idx)
         else:
             back_pressed_at = None
 
         time.sleep(0.02)
-
 
 if __name__ == "__main__":
     main()
