@@ -267,117 +267,114 @@ def poweroff():
 # =====================================================
 # MODULE RUNNER
 # =====================================================
-def run_module(mod: Module, consume, clear):
+def run_module(mod, consume, clear, redraw_menu=None):
     """
-    Runs a module as a child process and forwards button events via stdin.
+    Runs a module as a child process and forwards button events to it via stdin.
 
     Expected stdin commands in the module:
       up, down, select, select_hold, back
 
-    IMPORTANT:
-      - BACK is forwarded to the module (navigation).
-      - Module decides whether BACK exits.
-      - Safety hatch: double-tap BACK quickly force-quits the module.
+    BACK handling:
+      - Forwarded to module for normal navigation.
+      - Double-tap BACK quickly (within 1s) to force-kill a stuck module.
     """
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = nav/exit")
 
-    entry = mod.entry_path
-    if not entry:
-        oled_message("LAUNCH FAIL", [mod.name, "Missing entry", ""], "BACK = menu")
-        time.sleep(1.2)
-        clear()
-        return
-
-    cmd = [str(HOME / "oledenv" / "bin" / "python"), str(entry)]
-
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(HOME)          # lets modules import oled.*
-    env["GPIOZERO_PIN_FACTORY"] = "lgpio"  # consistent with service
-    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
-    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
+    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
 
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,  # keep for crash hint
+            stderr=subprocess.DEVNULL,   # IMPORTANT: avoid PIPE deadlocks
             text=True,
             bufsize=1,
-            env=env,
+            env=os.environ.copy(),
         )
     except Exception as e:
         oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
         time.sleep(1.2)
         clear()
+        if redraw_menu:
+            redraw_menu()
         return
 
-    def send(line: str):
+    def send(cmd_text: str):
         try:
             if proc.poll() is None and proc.stdin:
-                proc.stdin.write(line + "\n")
+                proc.stdin.write(cmd_text + "\n")
                 proc.stdin.flush()
         except Exception:
             pass
 
-    back_armed_until = 0.0
-    order = ("up", "down", "select", "select_hold", "back")
+    back_force_deadline = 0.0
 
-    while proc.poll() is None:
+    # Run loop (keep it tight; never block for long)
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+
         ev = None
-        for name in order:
-            if consume(name):
-                ev = name
+        # Consume only one event per tick so we don't backlog
+        for key in ("up", "down", "select", "select_hold", "back"):
+            if consume(key):
+                ev = key
                 break
 
         if ev:
             send(ev)
 
             if ev == "back":
-                # Safety hatch: tap BACK twice quickly to force-exit a stuck module
                 now = time.time()
-                if now < back_armed_until:
-                    proc.terminate()
+                if now < back_force_deadline:
+                    # force kill
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
                     break
-                back_armed_until = now + 1.0
+                back_force_deadline = now + 1.0
 
         time.sleep(0.02)
 
-    # show crash hint if non-zero exit
-    try:
-        rc = proc.poll()
-        if rc not in (0, None) and proc.stderr:
-            tail = proc.stderr.read()[-350:].replace("\n", " ")
-            oled_message("MODULE CRASH", [mod.name, tail[:21], tail[21:42]], "BACK = menu")
-            time.sleep(1.6)
-    except Exception:
-        pass
+    # Clean shutdown without UI freeze:
+    # give it a short moment to exit; then kill if needed
+    for _ in range(20):  # ~0.4s total
+        if proc.poll() is not None:
+            break
+        time.sleep(0.02)
 
-    # cleanup
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    # Close stdin to release resources
     try:
         if proc.stdin:
             proc.stdin.close()
     except Exception:
         pass
+
+    # Do NOT block long on wait()
     try:
-        if proc.stderr:
-            proc.stderr.close()
+        proc.wait(timeout=0.2)
     except Exception:
         pass
 
-    try:
-        proc.wait(timeout=1.0)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    
-    # Nudge the OLED back to life quickly after module exit
-    oled_message("GHOST GEEKS", ["Returning to menu", "", ""], "")
-    time.sleep(0.1)
-    
+    # IMPORTANT: flush any queued button presses that happened during exit
     clear()
+
+    # IMPORTANT: force redraw NOW so menu doesn't "wake up later"
+    if redraw_menu:
+        redraw_menu()
+    else:
+        # fallback: at least draw something
+        oled_message("GHOST GEEKS", ["Returning...", "", ""], "")
+        time.sleep(0.1)
 
 # =====================================================
 # SETTINGS SCREEN
