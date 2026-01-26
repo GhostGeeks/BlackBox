@@ -301,7 +301,7 @@ def run_module(mod: Module, consume, clear):
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,  # keep for crash hint
+            stderr=subprocess.DEVNULL,  # keep for crash hint
             text=True,
             bufsize=1,
             env=env,
@@ -372,7 +372,11 @@ def run_module(mod: Module, consume, clear):
             proc.kill()
         except Exception:
             pass
-
+    
+    # Nudge the OLED back to life quickly after module exit
+    oled_message("GHOST GEEKS", ["Returning to menu", "", ""], "")
+    time.sleep(0.1)
+    
     clear()
 
 # =====================================================
