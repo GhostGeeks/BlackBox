@@ -1,155 +1,160 @@
-        #!/usr/bin/env python3
-import os
-os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
+#!/usr/bin/env python3
+"""
+Ghost Geeks OLED UI - app.py (clean replacement)
 
-import time
-import math
-import subprocess
+Fixes:
+- Always refresh OLED after a module exits (prevents “blank menu” until next button press)
+- Run modules as child processes and forward button events via stdin
+- Capture each module's stdout/stderr to /home/ghostgeeks01/oled/logs/<module>_YYYYMMDD_HHMMSS.log
+- More robust process cleanup (terminate -> kill fallback)
+"""
+
+from __future__ import annotations
+
 import json
+import os
+import signal
+import subprocess
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from gpiozero import Button
 from luma.core.interface.serial import i2c
-from luma.oled.device import ssd1306
 from luma.core.render import canvas
-
+from luma.oled.device import ssd1306
 
 # =====================================================
 # CONFIG
 # =====================================================
-I2C_PORT = 1
-I2C_ADDR = 0x3C
+
+OLED_ADDR = 0x3C
 OLED_W, OLED_H = 128, 64
+
+MODULE_DIR = Path("/home/ghostgeeks01/oled/modules")
+LOG_DIR = Path("/home/ghostgeeks01/oled/logs")
 
 # Buttons (BCM)
 BTN_UP = 17
 BTN_DOWN = 27
 BTN_SELECT = 22
 BTN_BACK = 23
+SELECT_HOLD_SECONDS = 0.8
 
-# Hold timings
-SELECT_HOLD_SECONDS = 1.0
-BACK_REBOOT_HOLD = 2.0
-BACK_POWEROFF_HOLD = 5.0
-
-HOME = Path("/home/ghostgeeks01")
-APP_DIR = HOME / "oled"
-MODULE_DIR = APP_DIR / "modules"
-SD_TEST_FILE = APP_DIR / ".sd_write_test"
-
-SPLASH_MIN_SECONDS = 5.0
-SPLASH_FRAME_SLEEP = 0.08
-
+# UI metrics
+HEADER_H = 12
+FOOTER_Y = 54  # lift the footer a bit so it isn't clipped
+LINE_H = 12
 
 # =====================================================
-# OLED (re-init safe)
+# OLED SETUP
 # =====================================================
-_serial = None
-device = None
 
-def oled_init():
-    """(Re)initialize the OLED. Call this after modules exit to avoid 'black screen'."""
-    global _serial, device
-    _serial = i2c(port=I2C_PORT, address=I2C_ADDR)
-    device = ssd1306(_serial, width=OLED_W, height=OLED_H)
-
-def oled_hard_wake():
-    """
-    Some child processes leave the SSD1306 in DISPLAYOFF or similar state.
-    Re-init fixes it reliably.
-    """
-    try:
-        oled_init()
-    except Exception:
-        # If I2C is momentarily busy, give it a beat and retry once.
-        time.sleep(0.05)
-        oled_init()
-
-# Initialize once at startup
-oled_init()
+serial = i2c(port=1, address=OLED_ADDR)
+device = ssd1306(serial, width=OLED_W, height=OLED_H)
 
 
-# =====================================================
-# UTILITIES
-# =====================================================
-def sd_write_check() -> Optional[str]:
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        SD_TEST_FILE.write_text("ok\n")
-        SD_TEST_FILE.unlink(missing_ok=True)
-        return None
-    except Exception as e:
-        return str(e)
-
-def get_ip() -> str:
-    try:
-        ips = subprocess.check_output(["hostname", "-I"], text=True).split()
-        for ip in ips:
-            if ip.count(".") == 3 and not ip.startswith("169.254"):
-                return ip
-        return ""
-    except Exception:
-        return ""
-
-def hostname() -> str:
-    return subprocess.getoutput("hostname").strip()
-
-def uptime_short() -> str:
-    return subprocess.getoutput("uptime -p").replace("up ", "").strip()
+def _hr_line(d, y: int):
+    d.line((0, y, OLED_W - 1, y), fill=255)
 
 
-# =====================================================
-# OLED DRAW HELPERS
-# =====================================================
 def oled_message(title: str, lines: List[str], footer: str = ""):
-    # Make sure device exists (re-init safe)
-    if device is None:
-        oled_hard_wake()
+    """Simple 3-line screen with header + footer."""
+    with canvas(device) as d:
+        d.text((0, 0), title[:21], fill=255)
+        _hr_line(d, HEADER_H - 1)
 
-    with canvas(device) as draw:
-        draw.text((0, 0), title[:21], fill=255)
-        draw.line((0, 12, 127, 12), fill=255)
-        y = 16
-        for ln in lines[:3]:
-            draw.text((0, y), ln[:21], fill=255)
-            y += 12
+        y = HEADER_H
+        for s in lines[:3]:
+            d.text((0, y), (s or "")[:21], fill=255)
+            y += LINE_H
+
         if footer:
-            draw.text((0, 54), footer[:21], fill=255)
+            _hr_line(d, FOOTER_Y - 2)
+            d.text((0, FOOTER_Y), footer[:21], fill=255)
 
-def draw_waveform(draw, phase):
-    mid = 40
-    amp = 10
-    pts = []
-    for x in range(120):
-        t = (x / 120) * (2 * math.pi)
-        y = math.sin(t * 2 + phase)
-        pts.append((4 + x, int(mid - y * amp)))
-    draw.rectangle((2, 26, 125, 53), outline=255)
-    draw.line(pts, fill=255)
+
+def oled_clear():
+    device.clear()
+    device.show()
+
+
+def force_menu_redraw(mods: List["Module"], sel: int):
+    """
+    Force a hard refresh of the menu (prevents blank OLED after module exit).
+    Some child modules leave the OLED cleared; this guarantees we redraw.
+    """
+    try:
+        device.clear()
+        device.show()
+    except Exception:
+        pass
+    time.sleep(0.05)
+    draw_menu(mods, sel)
+
+
+# =====================================================
+# MODULE DISCOVERY
+# =====================================================
+
+@dataclass
+class Module:
+    id: str
+    name: str
+    subtitle: str
+    entry_path: str
+    order: int = 999
+
+
+def discover_modules(module_dir: Path) -> List[Module]:
+    mods: List[Module] = []
+    if not module_dir.exists():
+        return mods
+
+    for d in sorted(module_dir.iterdir()):
+        if not d.is_dir():
+            continue
+
+        entry = d / "run.py"
+        meta_path = d / "module.json"
+        if not entry.exists():
+            continue
+
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:
+                meta = {}
+
+        mods.append(
+            Module(
+                id=str(meta.get("id", d.name)),
+                name=str(meta.get("name", d.name)),
+                subtitle=str(meta.get("subtitle", "")),
+                entry_path=str(entry),
+                order=int(meta.get("order", 999)),
+            )
+        )
+
+    mods.sort(key=lambda m: (m.order, m.name.lower()))
+    return mods
 
 
 # =====================================================
 # BUTTONS
 # =====================================================
+
 def init_buttons():
-    events = {
-        "up": False,
-        "down": False,
-        "select": False,
-        "select_hold": False,
-        "back": False,
-    }
+    events = {"up": False, "down": False, "select": False, "select_hold": False, "back": False}
 
     btn_up = Button(BTN_UP, pull_up=True, bounce_time=0.06)
     btn_down = Button(BTN_DOWN, pull_up=True, bounce_time=0.06)
 
     btn_select = Button(
-        BTN_SELECT,
-        pull_up=True,
-        bounce_time=0.06,
-        hold_time=SELECT_HOLD_SECONDS
+        BTN_SELECT, pull_up=True, bounce_time=0.06, hold_time=SELECT_HOLD_SECONDS
     )
     btn_back = Button(BTN_BACK, pull_up=True, bounce_time=0.06)
 
@@ -161,8 +166,8 @@ def init_buttons():
 
     btn_back.when_pressed = lambda: events.__setitem__("back", True)
 
-    def consume(k):
-        if events.get(k):
+    def consume(k: str) -> bool:
+        if events[k]:
             events[k] = False
             return True
         return False
@@ -171,400 +176,207 @@ def init_buttons():
         for k in events:
             events[k] = False
 
+    # return button objects so they stay alive
     return consume, clear, (btn_up, btn_down, btn_select, btn_back)
 
 
 # =====================================================
-# MODULES
+# MENU UI
 # =====================================================
-@dataclass
-class Module:
-    id: str
-    name: str
-    subtitle: str
-    entry_path: str
-    order: int = 999
 
-def ensure_modules_dir():
-    MODULE_DIR.mkdir(parents=True, exist_ok=True)
+def draw_menu(mods: List[Module], sel: int):
+    with canvas(device) as d:
+        d.text((0, 0), "MODULES", fill=255)
+        _hr_line(d, HEADER_H - 1)
 
-def discover_modules(modules_root: Path) -> List[Module]:
-    mods: List[Module] = []
-    if not modules_root.exists():
-        return mods
+        # Display 4 rows max
+        rows = 4
+        start = max(0, min(sel - 1, max(0, len(mods) - rows)))
+        y = HEADER_H
 
-    for d in sorted(modules_root.iterdir()):
-        if not d.is_dir():
-            continue
+        for i in range(start, min(start + rows, len(mods))):
+            m = mods[i]
+            prefix = ">" if i == sel else " "
+            label = f"{prefix} {m.name}"
+            d.text((0, y), label[:21], fill=255)
+            y += LINE_H
 
-        meta_path = d / "module.json"
-        if not meta_path.exists():
-            continue
-
-        try:
-            meta = json.loads(meta_path.read_text())
-            if not meta.get("enabled", True):
-                continue
-
-            entry = meta.get("entry", "run.py")
-            entry_path = d / entry
-            if not entry_path.exists():
-                continue
-
-            mods.append(
-                Module(
-                    id=str(meta.get("id", d.name)),
-                    name=str(meta.get("name", d.name)),
-                    subtitle=str(meta.get("subtitle", "")),
-                    entry_path=str(entry_path),
-                    order=int(meta.get("order", 999)),
-                )
-            )
-        except Exception:
-            continue
-
-    mods.sort(key=lambda m: (m.order, m.name.lower()))
-    return mods
-
-
-# =====================================================
-# UI SCREENS
-# =====================================================
-def splash():
-    start = time.time()
-    phase = 0.0
-    while True:
-        if device is None:
-            oled_hard_wake()
-
-        with canvas(device) as draw:
-            draw.text((0, 2), "GHOST GEEKS", fill=255)
-            draw.text((0, 14), "REAL GHOST GEAR", fill=255)
-            draw.text((0, 54), "BOOTING UP THE LAB...", fill=255)
-            draw_waveform(draw, phase)
-
-        phase += 0.15
-        if (time.time() - start) >= SPLASH_MIN_SECONDS and get_ip():
-            return
-        time.sleep(SPLASH_FRAME_SLEEP)
-
-def draw_menu(mods: List[Module], idx: int):
-    # Re-init-safe: if a module shut the display off, wake it first
-    if device is None:
-        oled_hard_wake()
-
-    with canvas(device) as draw:
-        draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
-        draw.line((0, 12, 127, 12), fill=255)
-
-        visible_rows = 3
-        start_i = 0
-        if len(mods) > visible_rows:
-            start_i = max(0, min(idx - 1, len(mods) - visible_rows))
-
-        for row in range(visible_rows):
-            i = start_i + row
-            if i >= len(mods):
-                break
-            prefix = ">" if i == idx else " "
-            draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
-
-        draw.text((0, 54), "SEL run  HOLD=cfg", fill=255)
-
-
-# =====================================================
-# POWER CONFIRM
-# =====================================================
-def confirm_action(label, consume, clear):
-    clear()
-    end = time.time() + 3
-    while True:
-        remaining = int(end - time.time()) + 1
-        if remaining <= 0:
-            return True
-        oled_message(label, [f"Confirm in {remaining}s", "Tap BACK to cancel", ""])
-        if consume("back"):
-            oled_message("CANCELLED", ["Returning...", "", ""])
-            time.sleep(0.5)
-            clear()
-            return False
-        time.sleep(0.05)
-
-def reboot():
-    oled_message("REBOOT", ["Rebooting...", "", ""])
-    subprocess.Popen(["sudo", "-n", "systemctl", "reboot"])
-
-def poweroff():
-    oled_message("POWEROFF", ["Shutting down...", "", ""])
-    subprocess.Popen(["sudo", "-n", "systemctl", "poweroff"])
-
-
-# =====================================================
-# SETTINGS
-# =====================================================
-def settings(consume, clear):
-    clear()
-    while True:
-        oled_message(
-            "SETTINGS",
-            [hostname(), f"IP {get_ip()}", f"UPTIME {uptime_short()}"],
-            "BACK = menu",
-        )
-        if consume("back"):
-            clear()
-            return
-        time.sleep(0.1)
+        _hr_line(d, FOOTER_Y - 2)
+        d.text((0, FOOTER_Y), "UP/DN sel  SEL run  BK quit"[:21], fill=255)
 
 
 # =====================================================
 # MODULE RUNNER
 # =====================================================
-def run_module(mod, consume, clear):
+
+def _open_logfile(module_id: str):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = LOG_DIR / f"{module_id}_{ts}.log"
+    return path, open(path, "w", buffering=1)
+
+
+def run_module(mod: Module, consume, clear, mods: List[Module], sel_index: int):
     """
     Runs a module as a child process and forwards button events to it via stdin.
 
     Expected stdin commands in the module:
       up, down, select, select_hold, back
-
-    Key improvements:
-      - Uses module directory as cwd (fixes modules that rely on relative paths)
-      - Logs stdout+stderr to /home/ghostgeeks01/oled/logs/<module>_YYYYmmdd_HHMMSS.log
-      - Doesn't blank the OLED on return (only clears button events)
-      - Attempts graceful exit on BACK, then terminate/kill if needed
     """
-    import os
-    import subprocess
-    import time
-    from pathlib import Path
-    from datetime import datetime
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
-    # Show a quick "running" screen (optional)
-    try:
-        oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
-    except Exception:
-        pass
+    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
 
-    entry = getattr(mod, "entry_path", None) or getattr(mod, "entry", None)
-    if not entry:
-        try:
-            oled_message("LAUNCH FAIL", [mod.name, "Missing entry", ""], "BACK = menu")
-        except Exception:
-            pass
-        time.sleep(1.0)
-        clear()
-        return
+    log_path, logf = _open_logfile(mod.id)
 
-    entry_path = Path(str(entry))
-    cwd = str(entry_path.parent)
-
-    python_bin = "/home/ghostgeeks01/oledenv/bin/python"
-    cmd = [python_bin, str(entry_path)]
-
-    # Environment so modules can import shared bits and use PipeWire/BT
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/home/ghostgeeks01"
-    env["GPIOZERO_PIN_FACTORY"] = "lgpio"
-    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
-    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
-
-    # Module logging
-    logs_dir = Path("/home/ghostgeeks01/oled/logs")
-    try:
-        logs_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    safe_name = "".join(c for c in (getattr(mod, "id", "") or getattr(mod, "name", "module")) if c.isalnum() or c in ("_", "-"))
-    if not safe_name:
-        safe_name = "module"
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = logs_dir / f"{safe_name}_{ts}.log"
-
-    try:
-        logf = open(log_path, "w", buffering=1)  # line-buffered
-    except Exception:
-        logf = None
+    env["PYTHONUNBUFFERED"] = "1"
+    # Allow modules to import shared helpers from /home/ghostgeeks01/oled
+    env.setdefault("PYTHONPATH", "/home/ghostgeeks01/oled")
+    # Keep gpio backend consistent if a module uses gpiozero (most should NOT)
+    env.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
 
     try:
         proc = subprocess.Popen(
             cmd,
-            cwd=cwd,
-            env=env,
             stdin=subprocess.PIPE,
-            stdout=(logf if logf else subprocess.DEVNULL),
-            stderr=(subprocess.STDOUT if logf else subprocess.DEVNULL),
+            stdout=logf,
+            stderr=logf,
             text=True,
             bufsize=1,
-            start_new_session=True,  # puts child in its own process group
+            env=env,
         )
     except Exception as e:
-        if logf:
-            try:
-                logf.write(f"Failed to launch: {e}\n")
-            except Exception:
-                pass
-            try:
-                logf.close()
-            except Exception:
-                pass
-        try:
-            oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
-        except Exception:
-            pass
-        time.sleep(1.2)
+        logf.write(f"[launcher] FAILED: {e}\n")
+        logf.close()
+        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], str(log_path.name)], "BACK = menu")
+        time.sleep(1.5)
         clear()
+        force_menu_redraw(mods, sel_index)
         return
 
-    def send(line: str):
+    def send(cmd_text: str):
         try:
             if proc.poll() is None and proc.stdin:
-                proc.stdin.write(line + "\n")
+                proc.stdin.write(cmd_text + "\n")
                 proc.stdin.flush()
         except Exception:
             pass
 
-    # Forward at most ONE event per tick (prevents spamming)
-    order = ("up", "down", "select", "select_hold", "back")
+    # Main loop while module runs
+    while proc.poll() is None:
+        if consume("up"):
+            send("up")
+        if consume("down"):
+            send("down")
+        if consume("select"):
+            send("select")
+        if consume("select_hold"):
+            send("select_hold")
+
+        if consume("back"):
+            # ask module to exit
+            send("back")
+            # wait briefly for clean shutdown
+            for _ in range(30):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            break
+
+        time.sleep(0.02)
+
+    # Cleanup
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
 
     try:
-        while proc.poll() is None:
-            ev = None
-            for name in order:
-                if consume(name):
-                    ev = name
-                    break
-
-            if ev:
-                send(ev)
-
-                if ev == "back":
-                    # give module a moment to exit itself
-                    for _ in range(30):
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.05)
-
-                    # still alive -> terminate process group
-                    if proc.poll() is None:
-                        try:
-                            os.killpg(proc.pid, subprocess.signal.SIGTERM)
-                        except Exception:
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
-
-                    # final wait, then SIGKILL if required
-                    for _ in range(30):
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.05)
-
-                    if proc.poll() is None:
-                        try:
-                            os.killpg(proc.pid, subprocess.signal.SIGKILL)
-                        except Exception:
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
-                    break
-
-            time.sleep(0.02)
-
-    finally:
-        # Always close stdin/log
+        proc.wait(timeout=1.0)
+    except Exception:
         try:
-            if proc.stdin:
-                proc.stdin.close()
+            proc.kill()
         except Exception:
             pass
 
-        try:
-            proc.wait(timeout=1.0)
-        except Exception:
-            pass
+    try:
+        logf.write(f"[launcher] exit_code={proc.returncode}\n")
+        logf.flush()
+        logf.close()
+    except Exception:
+        pass
 
-        if logf:
-            try:
-                logf.write(f"\n[exit] returncode={proc.poll()}  log={log_path}\n")
-            except Exception:
-                pass
-            try:
-                logf.close()
-            except Exception:
-                pass
+    clear()
 
-        # IMPORTANT: only clear button events; do NOT clear the OLED here
-        clear()
+    # Critical: hard redraw menu after module exit (fixes blank OLED)
+    force_menu_redraw(mods, sel_index)
+
+
 # =====================================================
 # MAIN
 # =====================================================
+
 def main():
-    if err := sd_write_check():
-        oled_message("SD ERROR", [err[:21]], "")
+    mods = discover_modules(MODULE_DIR)
+    if not mods:
+        oled_message("NO MODULES", ["No run.py found", str(MODULE_DIR)], "BACK = quit")
+        consume, clear, _btns = init_buttons()
         while True:
-            time.sleep(1)
+            if consume("back"):
+                break
+            time.sleep(0.05)
+        oled_clear()
+        return
 
-    ensure_modules_dir()
-    consume, clear, buttons = init_buttons()
-    btn_up, btn_down, btn_select, btn_back = buttons
+    consume, clear, _btns = init_buttons()
+    sel = 0
 
-    splash()
+    force_menu_redraw(mods, sel)
 
-    modules = discover_modules(MODULE_DIR)
-    if not modules:
-        oled_message("NO MODULES", ["Add modules under", "~/oled/modules", ""], "HOLD=cfg")
-        modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
-
-    idx = 0
-    draw_menu(modules, idx)
-
-    back_pressed_at = None
+    last_refresh = time.time()
 
     while True:
+        # Periodic refresh safety-net (prevents “stale/blank” if anything weird happens)
+        if time.time() - last_refresh > 1.0:
+            draw_menu(mods, sel)
+            last_refresh = time.time()
+
+        moved = False
+
         if consume("up"):
-            idx = (idx - 1) % len(modules)
-            draw_menu(modules, idx)
+            sel = (sel - 1) % len(mods)
+            moved = True
 
         if consume("down"):
-            idx = (idx + 1) % len(modules)
-            draw_menu(modules, idx)
+            sel = (sel + 1) % len(mods)
+            moved = True
 
         if consume("select"):
-            if modules[idx].id != "none":
-                run_module(modules[idx], consume, clear)
-            # Always redraw menu after returning (and after OLED wake)
-            draw_menu(modules, idx)
+            clear()
+            run_module(mods[sel], consume, clear, mods, sel)
+            # run_module already forced redraw
+            last_refresh = time.time()
+            continue
 
-        if consume("select_hold"):
-            settings(consume, clear)
-            draw_menu(modules, idx)
+        if moved:
+            draw_menu(mods, sel)
+            last_refresh = time.time()
 
-        # BACK holds
-        if btn_back.is_pressed:
-            if back_pressed_at is None:
-                back_pressed_at = time.time()
-            held = time.time() - back_pressed_at
-
-            if held >= BACK_POWEROFF_HOLD:
-                if confirm_action("POWEROFF?", consume, clear):
-                    poweroff()
-                    return
-                back_pressed_at = None
-                draw_menu(modules, idx)
-
-            elif held >= BACK_REBOOT_HOLD:
-                if confirm_action("REBOOT?", consume, clear):
-                    reboot()
-                    return
-                back_pressed_at = None
-                draw_menu(modules, idx)
-        else:
-            back_pressed_at = None
+        if consume("back"):
+            oled_message("GOODBYE", ["Ghost Geeks"], "",)
+            time.sleep(0.4)
+            oled_clear()
+            break
 
         time.sleep(0.02)
+
 
 if __name__ == "__main__":
     main()
