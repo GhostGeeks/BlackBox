@@ -4,7 +4,6 @@ import time
 import math
 import struct
 import subprocess
-import threading
 import select
 from dataclasses import dataclass
 
@@ -36,8 +35,7 @@ def render(draw_fn):
 
 
 def _text_w_px(s: str) -> int:
-    # luma default font ~6px per char
-    return len(s) * 6
+    return len(s) * 6  # default font width approximation
 
 
 def draw_header(d, title: str, status: str = ""):
@@ -61,6 +59,7 @@ def draw_row(d, y: int, text: str, selected: bool):
 
 
 def read_event():
+    """Non-blocking stdin event read (SpiritBox style)."""
     try:
         r, _, _ = select.select([sys.stdin], [], [], 0)
     except Exception:
@@ -74,162 +73,86 @@ def read_event():
 
 
 # ============================================================
-# AUDIO ENGINE — continuous sine streaming
+# AUDIO STREAMING (same proven path as NoiseGenerator)
 # ============================================================
 RATE = 48000
-CH = 2
-FRAMES_PER_CHUNK = 960  # 20ms
+CH = 1
+FMT = "S16_LE"
+FRAMES_PER_CHUNK = 1024
 TWOPI = 2.0 * math.pi
+
+
+def start_aplay():
+    return subprocess.Popen(
+        ["aplay", "-q", "-f", FMT, "-r", str(RATE), "-c", str(CH), "-t", "raw", "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_proc(p):
+    if not p:
+        return
+    try:
+        if p.stdin:
+            p.stdin.close()
+    except Exception:
+        pass
+    try:
+        if p.poll() is None:
+            p.terminate()
+    except Exception:
+        pass
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
 @dataclass
 class ToneState:
-    mode: str = "STEADY"    # STEADY / PULSE / SWEEP
+    mode: str = "STEADY"   # STEADY/PULSE/SWEEP
     playing: bool = False
-    volume: int = 70        # 0..100
     hz: float = 432.0
+    volume: int = 70       # 0..100
 
+    # pulse
     pulse_on_ms: int = 250
     pulse_off_ms: int = 250
+    _pulse_acc_ms: int = 0
+    _pulse_on: bool = True
 
+    # sweep
     sweep_start: float = 100.0
     sweep_end: float = 1200.0
     sweep_step: float = 5.0
     sweep_step_ms: int = 100
+    _sweep_hz: float = 100.0
+    _sweep_dir: int = 1
+    _sweep_acc_ms: int = 0
 
 
-class ToneEngine:
-    def __init__(self, st: ToneState):
-        self.st = st
-        self._stop = threading.Event()
-        self._thread = None
-        self._proc = None
-        self._phase = 0.0
+def gen_sine_block(phase: float, hz: float, vol: float):
+    """Return (bytes, new_phase)."""
+    inc = TWOPI * hz / RATE
+    out = bytearray()
+    for _ in range(FRAMES_PER_CHUNK):
+        v = math.sin(phase) * vol
+        s = int(max(-1.0, min(1.0, v)) * 32767)
+        out += struct.pack("<h", s)
+        phase += inc
+        if phase > TWOPI:
+            phase -= TWOPI
+    return bytes(out), phase
 
-        self._pulse_acc = 0
-        self._pulse_on = True
-        self._sweep_acc = 0
-        self._sweep_hz = st.sweep_start
-        self._sweep_dir = 1
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def shutdown(self):
-        self._stop.set()
-        self._close_proc()
-
-    def _pick_player(self):
-        # Prefer PipeWire if available
-        if subprocess.call(["bash", "-lc", "command -v pw-cat >/dev/null 2>&1"]) == 0:
-            return ["pw-cat", "--playback", "--rate", str(RATE), "--channels", str(CH), "--format", "s16le"]
-        # Fallback to ALSA
-        return ["aplay", "-q", "-f", "S16_LE", "-r", str(RATE), "-c", str(CH), "-t", "raw", "-"]
-
-    def _ensure_proc(self):
-        if self._proc and self._proc.poll() is None:
-            return
-        cmd = self._pick_player()
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    def _close_proc(self):
-        try:
-            if self._proc and self._proc.stdin:
-                self._proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-        except Exception:
-            pass
-        self._proc = None
-
-    def _write(self, buf: bytes):
-        try:
-            if self._proc and self._proc.stdin:
-                self._proc.stdin.write(buf)
-                self._proc.stdin.flush()
-        except Exception:
-            pass
-
-    def _gen_sine(self, hz: float, amp: float) -> bytes:
-        inc = TWOPI * hz / RATE
-        ph = self._phase
-
-        out = bytearray()
-        for _ in range(FRAMES_PER_CHUNK):
-            v = math.sin(ph) * amp
-            s = int(max(-1.0, min(1.0, v)) * 32767)
-            out += struct.pack("<h", s)  # L
-            out += struct.pack("<h", s)  # R
-            ph += inc
-            if ph > TWOPI:
-                ph -= TWOPI
-
-        self._phase = ph
-        return bytes(out)
-
-    def _gen_silence(self) -> bytes:
-        return b"\x00\x00" * (FRAMES_PER_CHUNK * CH)
-
-    def _run(self):
-        tick_ms = 20
-        while not self._stop.is_set():
-            if not self.st.playing:
-                self._close_proc()
-                time.sleep(0.03)
-                continue
-
-            self._ensure_proc()
-            amp = max(0.0, min(1.0, self.st.volume / 100.0))
-            hz = self.st.hz
-
-            if self.st.mode == "PULSE":
-                self._pulse_acc += tick_ms
-                if self._pulse_on:
-                    buf = self._gen_sine(hz, amp)
-                    if self._pulse_acc >= self.st.pulse_on_ms:
-                        self._pulse_acc = 0
-                        self._pulse_on = False
-                else:
-                    buf = self._gen_silence()
-                    if self._pulse_acc >= self.st.pulse_off_ms:
-                        self._pulse_acc = 0
-                        self._pulse_on = True
-
-            elif self.st.mode == "SWEEP":
-                # play at current sweep freq
-                buf = self._gen_sine(self._sweep_hz, amp)
-
-                self._sweep_acc += tick_ms
-                if self._sweep_acc >= self.st.sweep_step_ms:
-                    self._sweep_acc = 0
-                    self._sweep_hz += self.st.sweep_step * self._sweep_dir
-                    if self._sweep_hz >= self.st.sweep_end:
-                        self._sweep_hz = self.st.sweep_end
-                        self._sweep_dir = -1
-                    elif self._sweep_hz <= self.st.sweep_start:
-                        self._sweep_hz = self.st.sweep_start
-                        self._sweep_dir = 1
-            else:
-                buf = self._gen_sine(hz, amp)
-
-            self._write(buf)
-            time.sleep(FRAMES_PER_CHUNK / RATE)
+def gen_silence_block():
+    return b"\x00\x00" * FRAMES_PER_CHUNK
 
 
 # ============================================================
-# UI SCREENS
+# UI
 # ============================================================
 MAIN_ITEMS = ["Steady", "Pulse", "Sweep"]
 
@@ -247,154 +170,161 @@ def play_screen(st: ToneState):
     def _draw(d):
         status = "PLAY" if st.playing else "STOP"
         draw_header(d, "TONE", status=status)
-
         d.text((2, LIST_Y0), f"Mode: {st.mode}"[:21], fill=255)
         d.text((2, LIST_Y0 + 12), f"{st.hz:.1f} Hz"[:21], fill=255)
         d.text((2, LIST_Y0 + 24), f"VOL {st.volume}%"[:21], fill=255)
-
-        # no more status line down here (prevents footer overlap)
-        draw_footer(d, "SEL toggle  HOLD cfg  BK")
+        draw_footer(d, "SEL toggle  ^v vol  BK")
     return _draw
 
 
-def settings_screen(st: ToneState, sel_idx: int):
-    items = [
-        ("Hz", f"{st.hz:.1f}"),
-        ("Vol", f"{st.volume}%"),
-        ("Pulse on", f"{st.pulse_on_ms}ms"),
-        ("Pulse off", f"{st.pulse_off_ms}ms"),
-        ("Sweep step", f"{st.sweep_step:.1f}"),
-        ("Sweep ms", f"{st.sweep_step_ms}ms"),
-    ]
-
-    def _draw(d):
-        draw_header(d, "SETTINGS")
-        start = 0
-        visible = 3
-        if sel_idx >= visible:
-            start = sel_idx - (visible - 1)
-
-        for r in range(visible):
-            i = start + r
-            if i >= len(items):
-                break
-            k, v = items[i]
-            draw_row(d, LIST_Y0 + r * ROW_H, f"{k}: {v}", selected=(i == sel_idx))
-
-        draw_footer(d, "^v adj  SEL mode  BK")
-    return _draw, len(items)
-
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
 # ============================================================
-# MAIN (SpiritBox model)
+# MAIN (SpiritBox-style state machine)
 # ============================================================
 def main():
     st = ToneState()
-    engine = ToneEngine(st)
-    engine.start()  # thread idle unless playing=True
+    st._sweep_hz = st.sweep_start
 
     STATE_MENU = "MENU"
     STATE_PLAY = "PLAY"
-    STATE_CFG = "CFG"
 
     state = STATE_MENU
     menu_sel = 0
-    cfg_sel = 0
 
-    # BACK cooldown prevents the "double-back" behavior:
-    # if you hold/press BACK to return from PLAY->MENU, the next tick can still read BACK
-    # and MENU would immediately exit. This blocks that.
-    back_cooldown_until = 0.0
+    # Strong back lockout after returning to menu so a held/back-bounce
+    # can't immediately cause MENU->EXIT.
+    back_block_until = 0.0
+
+    # audio
+    proc = None
+    phase = 0.0
+
+    render(menu_screen(menu_sel))
+
+    last_audio_tick = time.monotonic()
 
     while True:
-        if state == STATE_MENU:
-            render(menu_screen(menu_sel))
-        elif state == STATE_PLAY:
-            render(play_screen(st))
-        elif state == STATE_CFG:
-            draw_fn, _n = settings_screen(st, cfg_sel)
-            render(draw_fn)
-
         ev = read_event()
-        if ev is None:
-            time.sleep(0.02)
-            continue
-
         now = time.monotonic()
 
-        # -------- MENU --------
+        # -----------------------
+        # Handle UI events
+        # -----------------------
         if state == STATE_MENU:
-            if ev == "back":
-                if now < back_cooldown_until:
-                    # ignore "stale" back
-                    pass
-                else:
-                    break  # exit module only from top menu
-            elif ev == "up":
+            if ev == "up":
                 menu_sel = (menu_sel - 1) % len(MAIN_ITEMS)
+                render(menu_screen(menu_sel))
+
             elif ev == "down":
                 menu_sel = (menu_sel + 1) % len(MAIN_ITEMS)
+                render(menu_screen(menu_sel))
+
             elif ev == "select":
                 st.mode = MAIN_ITEMS[menu_sel].upper()
                 st.playing = False
-                state = STATE_PLAY
+                # reset mode-specific internals
+                st._pulse_acc_ms = 0
+                st._pulse_on = True
+                st._sweep_hz = st.sweep_start
+                st._sweep_dir = 1
+                st._sweep_acc_ms = 0
 
-        # -------- PLAY --------
-        elif state == STATE_PLAY:
-            if ev == "select":
-                st.playing = not st.playing
-            elif ev == "select_hold":
-                cfg_sel = 0
-                state = STATE_CFG
+                state = STATE_PLAY
+                render(play_screen(st))
+
             elif ev == "back":
-                st.playing = False
-                state = STATE_MENU
-                back_cooldown_until = time.monotonic() + 0.35
-            elif ev == "up":
+                if now >= back_block_until:
+                    break  # exit module ONLY from top menu
+
+        elif state == STATE_PLAY:
+            if ev == "up":
                 st.volume = clamp(st.volume + 5, 0, 100)
+                render(play_screen(st))
+
             elif ev == "down":
                 st.volume = clamp(st.volume - 5, 0, 100)
+                render(play_screen(st))
 
-        # -------- CFG --------
-        elif state == STATE_CFG:
-            _draw_fn, n = settings_screen(st, cfg_sel)
-
-            if ev == "back":
-                state = STATE_PLAY
-                back_cooldown_until = time.monotonic() + 0.25
             elif ev == "select":
-                # cycle mode quickly
-                if st.mode == "STEADY":
-                    st.mode = "PULSE"
-                elif st.mode == "PULSE":
-                    st.mode = "SWEEP"
+                st.playing = not st.playing
+                render(play_screen(st))
+
+            elif ev == "back":
+                # stop playback + return to menu (do NOT exit)
+                st.playing = False
+                stop_proc(proc)
+                proc = None
+                state = STATE_MENU
+                render(menu_screen(menu_sel))
+                back_block_until = time.monotonic() + 1.25  # strong lockout
+
+        # -----------------------
+        # Audio tick (continuous)
+        # -----------------------
+        # Stream at roughly real-time pace.
+        # This is what avoids the "2s chunk loop" and ensures continuous tone.
+        dt = now - last_audio_tick
+        if dt < (FRAMES_PER_CHUNK / RATE):
+            time.sleep(0.001)
+            continue
+        last_audio_tick = now
+
+        if st.playing:
+            if proc is None or proc.poll() is not None:
+                proc = start_aplay()
+
+            vol = clamp(st.volume / 100.0, 0.0, 1.0)
+
+            if st.mode == "STEADY":
+                buf, phase = gen_sine_block(phase, st.hz, vol)
+
+            elif st.mode == "PULSE":
+                tick_ms = int(1000 * (FRAMES_PER_CHUNK / RATE))
+                st._pulse_acc_ms += tick_ms
+                if st._pulse_on:
+                    buf, phase = gen_sine_block(phase, st.hz, vol)
+                    if st._pulse_acc_ms >= st.pulse_on_ms:
+                        st._pulse_acc_ms = 0
+                        st._pulse_on = False
                 else:
-                    st.mode = "STEADY"
-            elif ev == "select_hold":
-                cfg_sel = (cfg_sel + 1) % n
-            elif ev == "up":
-                if cfg_sel == 0: st.hz = clamp(st.hz + 1.0, 1.0, 20000.0)
-                if cfg_sel == 1: st.volume = clamp(st.volume + 5, 0, 100)
-                if cfg_sel == 2: st.pulse_on_ms = clamp(st.pulse_on_ms + 50, 50, 2000)
-                if cfg_sel == 3: st.pulse_off_ms = clamp(st.pulse_off_ms + 50, 50, 2000)
-                if cfg_sel == 4: st.sweep_step = clamp(st.sweep_step + 1.0, 0.1, 2000.0)
-                if cfg_sel == 5: st.sweep_step_ms = clamp(st.sweep_step_ms + 50, 50, 2000)
-            elif ev == "down":
-                if cfg_sel == 0: st.hz = clamp(st.hz - 1.0, 1.0, 20000.0)
-                if cfg_sel == 1: st.volume = clamp(st.volume - 5, 0, 100)
-                if cfg_sel == 2: st.pulse_on_ms = clamp(st.pulse_on_ms - 50, 50, 2000)
-                if cfg_sel == 3: st.pulse_off_ms = clamp(st.pulse_off_ms - 50, 50, 2000)
-                if cfg_sel == 4: st.sweep_step = clamp(st.sweep_step - 1.0, 0.1, 2000.0)
-                if cfg_sel == 5: st.sweep_step_ms = clamp(st.sweep_step_ms - 50, 50, 2000)
+                    buf = gen_silence_block()
+                    if st._pulse_acc_ms >= st.pulse_off_ms:
+                        st._pulse_acc_ms = 0
+                        st._pulse_on = True
 
-        time.sleep(0.02)
+            else:  # SWEEP
+                tick_ms = int(1000 * (FRAMES_PER_CHUNK / RATE))
+                buf, phase = gen_sine_block(phase, st._sweep_hz, vol)
 
+                st._sweep_acc_ms += tick_ms
+                if st._sweep_acc_ms >= st.sweep_step_ms:
+                    st._sweep_acc_ms = 0
+                    st._sweep_hz += st.sweep_step * st._sweep_dir
+                    if st._sweep_hz >= st.sweep_end:
+                        st._sweep_hz = st.sweep_end
+                        st._sweep_dir = -1
+                    elif st._sweep_hz <= st.sweep_start:
+                        st._sweep_hz = st.sweep_start
+                        st._sweep_dir = 1
+
+            try:
+                if proc.stdin:
+                    proc.stdin.write(buf)
+                    proc.stdin.flush()
+            except Exception:
+                stop_proc(proc)
+                proc = None
+
+        else:
+            # not playing -> ensure proc is stopped
+            if proc is not None:
+                stop_proc(proc)
+                proc = None
+
+        time.sleep(0.001)
+
+    # cleanup
     st.playing = False
-    engine.shutdown()
+    stop_proc(proc)
     render(lambda d: d.rectangle((0, 0, OLED_W - 1, OLED_H - 1), outline=0, fill=0))
     time.sleep(0.15)
 
