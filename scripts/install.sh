@@ -99,4 +99,10 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
+echo "==> Verifying venv interpreter..."
+test -x "$VENV_DIR/bin/python"
+
+echo "==> Verifying imports..."
+"$VENV_DIR/bin/python" -c "import gpiozero, lgpio; import luma.core, luma.oled; import PIL; print('imports OK')"
+
 echo "==> Install complete."
