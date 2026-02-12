@@ -76,6 +76,9 @@ SPLASH_FRAME_SLEEP = 0.08
 # Menu refresh watchdog (helps recover from rare "blank menu" states)
 MENU_REFRESH_SECONDS = 2.0
 
+# Device Branding Reference
+BRAND_NAME = "BLACKBOX"
+
 
 # =====================================================
 # OLED (re-init safe)
@@ -559,7 +562,7 @@ def draw_menu(mods: List[Module], idx: int) -> None:
     oled_guard()
     with canvas(device) as draw:
         # Header left
-        draw.text((0, 0), "BLACKBOX MENU", fill=255)
+        draw.text((0, 0), f"{BRAND_NAME} MENU", fill=255)
 
         # Header right: Bluetooth + Wi-Fi bars
         # Start from far-right and draw BT, then Wi-Fi to its left
