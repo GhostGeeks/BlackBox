@@ -162,6 +162,7 @@ def uptime_short() -> str:
 
 def ensure_dirs() -> None:
     MODULE_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -304,6 +305,94 @@ def discover_modules(modules_root: Path) -> List[Module]:
 
     mods.sort(key=lambda m: (m.order, m.name.lower()))
     return mods
+
+
+# =====================================================
+# RADIO CONNECTIONS (Bluetooth autoconnect)
+# =====================================================
+CONNECTIONS_FILE = DATA_DIR / "connections.json"
+
+
+def load_connections() -> dict:
+    """
+    Load /opt/blackbox/data/connections.json (or BLACKBOX_DATA override).
+    Returns {} if missing or invalid.
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if not CONNECTIONS_FILE.exists():
+            return {}
+        return json.loads(CONNECTIONS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def bluetooth_is_connected(mac: str) -> bool:
+    try:
+        r = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, text=True, timeout=3)
+        return "Connected: yes" in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def bluetooth_connect(mac: str, timeout: float = 8.0) -> bool:
+    """
+    Attempt to connect to a known/trusted device.
+    Returns True if connected, False otherwise.
+    Never blocks longer than timeout.
+    """
+    # Safe: ensures BT isn't soft-blocked
+    try:
+        subprocess.run(["rfkill", "unblock", "bluetooth"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
+
+    # If already connected, we're done
+    if bluetooth_is_connected(mac):
+        return True
+
+    start = time.time()
+    while (time.time() - start) < timeout:
+        try:
+            subprocess.run(["bluetoothctl", "connect", mac], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+        except Exception:
+            pass
+
+        if bluetooth_is_connected(mac):
+            return True
+
+        time.sleep(1.5)
+
+    return False
+
+
+def bluetooth_autoconnect_ui() -> bool:
+    """
+    Reads connections.json and attempts BT connect if configured.
+    Shows a short status message on OLED.
+    Returns True if connected, else False (or no config).
+    """
+    cfg = load_connections()
+    bt = (cfg or {}).get("bluetooth", {}) if isinstance(cfg, dict) else {}
+    mac = (bt.get("mac") or "").strip()
+    autoconnect = bool(bt.get("autoconnect", False))
+
+    if not mac or not autoconnect:
+        return False
+
+    oled_message("CONNECTING BT", [mac, "Please wait...", ""], "BACK = skip")
+
+    # Try a short connect window
+    ok = bluetooth_connect(mac, timeout=8.0)
+
+    if ok:
+        oled_message("BT CONNECTED", [mac, "", ""], "")
+        time.sleep(0.6)
+        return True
+
+    oled_message("BT NOT CONNECTED", [mac, "Continuing...", ""], "")
+    time.sleep(0.6)
+    return False
 
 
 # =====================================================
@@ -532,6 +621,14 @@ def main() -> None:
     btn_up, btn_down, btn_select, btn_back = buttons
 
     splash()
+
+    # Attempt BT autoconnect AFTER splash, BEFORE menu
+    # (quick, timeout-limited, continues either way)
+    clear()
+    drain_events(consume, seconds=0.10)
+    bluetooth_autoconnect_ui()
+    clear()
+    drain_events(consume, seconds=0.10)
 
     modules = discover_modules(MODULE_DIR)
     if not modules:
