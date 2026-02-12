@@ -54,7 +54,12 @@ apt install -y \
   libjpeg-dev zlib1g-dev \
   libfreetype6-dev \
   fonts-dejavu-core \
-  raspi-config
+  raspi-config \
+  swig \
+  build-essential \
+  python3-dev \
+  liblgio-dev \
+  liblgpio1 
 
 # =========================
 # DEVICE ID (persistent)
