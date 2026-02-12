@@ -77,8 +77,15 @@ SPLASH_FRAME_SLEEP = 0.08
 MENU_REFRESH_SECONDS = 2.0
 
 # Device Branding Reference
-BRAND_NAME = "BLACKBOX"
+BRAND_NAME = "CHOST GEEKS"
 
+# =====================================================
+# BRANDING
+# =====================================================
+PRODUCT_NAME = "BLACKBOX"
+PRODUCT_SUBTITLE = "PARANORMAL AUDIO"
+TAGLINE = "FIELD UNIT"
+VERSION = "v0.9"  # bump as you like
 
 # =====================================================
 # OLED (re-init safe)
@@ -386,13 +393,13 @@ def bluetooth_autoconnect_ui() -> bool:
     if not mac or not autoconnect:
         return False
 
-    oled_message("CONNECTING BT", [mac, "Please wait...", ""], "BACK = skip")
+    oled_message(f"{PRODUCT_NAME} AUDIO", [mac, "Connecting...", ""], "BACK = skip")
 
     # Try a short connect window
     ok = bluetooth_connect(mac, timeout=8.0)
 
     if ok:
-        oled_message("BT CONNECTED", [mac, "", ""], "")
+        oled_message("AUDIO READY", [mac, "", ""], "")
         time.sleep(0.6)
         return True
 
@@ -540,19 +547,47 @@ def status_refresh(force: bool = False) -> None:
 # UI SCREENS
 # =====================================================
 def splash() -> None:
+    """
+    Instrument-style boot screen:
+      - shows product name + subtitle
+      - shows version + minimal status line
+      - waits SPLASH_MIN_SECONDS and for IP (current behavior)
+    """
     start = time.time()
     phase = 0.0
+
     while True:
+        ip = get_ip()
+        net = "NET OK" if ip else "NET..."
+        bt = "BT OK" if (_status_bt_mac and bluetooth_is_connected(_status_bt_mac)) else "BT..."
+
         oled_guard()
         with canvas(device) as draw:
-            draw.text((0, 2), "GHOST GEEKS", fill=255)
-            draw.text((0, 14), "REAL GHOST GEAR", fill=255)
-            draw.text((0, 52), "BOOTING UP...", fill=255)
+            # Top: product name
+            draw.text((0, 0), PRODUCT_NAME[:21], fill=255)
+
+            # Right: version
+            draw.text((OLED_W - (len(VERSION) * 6), 0), VERSION, fill=255)
+
+            draw.line((0, 12, 127, 12), fill=255)
+
+            # Middle: subtitle + tagline
+            draw.text((0, 16), PRODUCT_SUBTITLE[:21], fill=255)
+            draw.text((0, 28), TAGLINE[:21], fill=255)
+
+            # Bottom: status line
+            draw.line((0, 44, 127, 44), fill=255)
+            draw.text((0, 48), f"{net}  {bt}"[:21], fill=255)
+
+            # Tiny waveform “alive” indicator (subtle)
             draw_waveform(draw, phase)
 
         phase += 0.15
-        if (time.time() - start) >= SPLASH_MIN_SECONDS and get_ip():
+
+        # Keep your existing behavior: minimum splash time + wait for IP
+        if (time.time() - start) >= SPLASH_MIN_SECONDS and ip:
             return
+
         time.sleep(SPLASH_FRAME_SLEEP)
 
 
@@ -562,7 +597,7 @@ def draw_menu(mods: List[Module], idx: int) -> None:
     oled_guard()
     with canvas(device) as draw:
         # Header left
-        draw.text((0, 0), f"{BRAND_NAME} MENU", fill=255)
+        draw.text((0, 0), f"{PRODUCT_NAME} MENU"[:21], fill=255)
 
         # Header right: Bluetooth + Wi-Fi bars
         # Start from far-right and draw BT, then Wi-Fi to its left
@@ -622,16 +657,24 @@ def poweroff() -> None:
 def settings(consume, clear) -> None:
     clear()
     while True:
+        status_refresh(force=True)
+        ip = get_ip() or "none"
+        up = uptime_short() or "unknown"
+        host = hostname() or "blackbox"
+
+        bt_state = "OK" if _bt_ok else "none"
+        wf = f"{_wifi_bars}/3"
+
         oled_message(
-            "SETTINGS",
-            [hostname(), f"IP {get_ip()}", f"UP {uptime_short()}"],
+            f"{PRODUCT_NAME} STATUS",
+            [f"HOST {host}"[:21], f"IP {ip}"[:21], f"WIFI {wf}  BT {bt_state}"[:21]],
             "BACK = menu",
         )
+
         if consume("back"):
             clear()
             return
-        time.sleep(0.1)
-
+        time.sleep(0.15)
 
 # =====================================================
 # MODULE RUNNER
