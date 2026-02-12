@@ -376,6 +376,9 @@ def bluetooth_autoconnect_ui() -> bool:
     bt = (cfg or {}).get("bluetooth", {}) if isinstance(cfg, dict) else {}
     mac = (bt.get("mac") or "").strip()
     autoconnect = bool(bt.get("autoconnect", False))
+    global _status_bt_mac
+    _status_bt_mac = mac
+
 
     if not mac or not autoconnect:
         return False
@@ -393,6 +396,53 @@ def bluetooth_autoconnect_ui() -> bool:
     oled_message("BT NOT CONNECTED", [mac, "Continuing...", ""], "")
     time.sleep(0.6)
     return False
+
+# =====================================================
+# STATUS INDICATORS (Wi-Fi + Bluetooth)
+# =====================================================
+
+_last_status_check = 0.0
+_status_wifi_ok = False
+_status_bt_ok = False
+_status_bt_mac = ""
+
+
+def _text_width_px(s: str) -> int:
+    # Default luma text uses a small bitmap font ~6px/char
+    return max(0, len(s)) * 6
+
+
+def _draw_right(draw, y: int, text: str) -> None:
+    x = max(0, OLED_W - _text_width_px(text))
+    draw.text((x, y), text, fill=255)
+
+
+def status_refresh(force: bool = False) -> None:
+    """
+    Refresh Wi-Fi + BT status at most ~every 2 seconds (unless forced).
+    Keeps menu feeling live without hammering bluetoothctl.
+    """
+    global _last_status_check, _status_wifi_ok, _status_bt_ok
+
+    now = time.time()
+    if (not force) and (now - _last_status_check) < 2.0:
+        return
+    _last_status_check = now
+
+    ip = get_ip()
+    _status_wifi_ok = bool(ip)
+
+    if _status_bt_mac:
+        _status_bt_ok = bluetooth_is_connected(_status_bt_mac)
+    else:
+        _status_bt_ok = False
+
+
+def status_string() -> str:
+    # W = Wi-Fi, B = Bluetooth
+    w = "W✓" if _status_wifi_ok else "W✕"
+    b = "B✓" if _status_bt_ok else "B✕"
+    return f"{w} {b}"
 
 
 # =====================================================
@@ -416,25 +466,37 @@ def splash() -> None:
 
 
 def draw_menu(mods: List[Module], idx: int) -> None:
+    status_refresh(force=False)
+
     oled_guard()
     with canvas(device) as draw:
-        draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
+        draw.text((0, 0), "GHOST GEEKS", fill=255)
+        _draw_right(draw, 0, status_string())
+
         draw.line((0, 12, 127, 12), fill=255)
+
+        # Optional: small network hint line (kept short)
+        ip = get_ip()
+        if ip:
+            draw.text((0, 14), f"IP {ip}"[:21], fill=255)
+        else:
+            draw.text((0, 14), "NO NETWORK"[:21], fill=255)
 
         visible_rows = 3
         start_i = 0
         if len(mods) > visible_rows:
             start_i = max(0, min(idx - 1, len(mods) - visible_rows))
 
+        # Menu rows start a bit lower now because we show IP line
+        base_y = 26
         for row in range(visible_rows):
             i = start_i + row
             if i >= len(mods):
                 break
             prefix = ">" if i == idx else " "
-            draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
+            draw.text((0, base_y + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
 
         draw.text((0, 52), "SEL run  HOLD=cfg", fill=255)
-
 
 # =====================================================
 # POWER CONFIRM
@@ -622,6 +684,8 @@ def main() -> None:
 
     splash()
 
+    status_refresh(force=True)
+
     # Attempt BT autoconnect AFTER splash, BEFORE menu
     # (quick, timeout-limited, continues either way)
     clear()
@@ -629,6 +693,8 @@ def main() -> None:
     bluetooth_autoconnect_ui()
     clear()
     drain_events(consume, seconds=0.10)
+
+    status_refresh(force=True)
 
     modules = discover_modules(MODULE_DIR)
     if not modules:
