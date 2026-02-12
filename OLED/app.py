@@ -19,6 +19,40 @@ from luma.core.render import canvas
 
 
 # =====================================================
+# PATHS (no hardcoded /home/*)
+# =====================================================
+def _resolve_root() -> Path:
+    """
+    Resolve the project root.
+    Priority:
+      1) BLACKBOX_ROOT env var (explicit override)
+      2) folder above this file (…/OLED/app.py -> root is …/)
+    """
+    env = os.environ.get("BLACKBOX_ROOT", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+ROOT_DIR = _resolve_root()
+
+# Detect modules dir with flexible casing
+MODULE_DIR_CANDIDATES = [
+    ROOT_DIR / "OLED" / "Modules",
+    ROOT_DIR / "OLED" / "modules",
+    ROOT_DIR / "Modules",
+    ROOT_DIR / "modules",
+]
+
+MODULE_DIR = next((p for p in MODULE_DIR_CANDIDATES if p.exists()), ROOT_DIR / "OLED" / "modules")
+
+# Logs/data kept inside install tree by default (works under /opt/blackbox with correct perms)
+DATA_DIR = Path(os.environ.get("BLACKBOX_DATA", str(ROOT_DIR / "data"))).expanduser().resolve()
+LOG_DIR = DATA_DIR / "logs"
+SD_TEST_FILE = DATA_DIR / ".sd_write_test"
+
+
+# =====================================================
 # CONFIG
 # =====================================================
 I2C_PORT = 1
@@ -35,22 +69,6 @@ BTN_BACK = 23
 SELECT_HOLD_SECONDS = 1.0
 BACK_REBOOT_HOLD = 2.0
 BACK_POWEROFF_HOLD = 5.0
-
-# -----------------------------
-# Deployment-root (new plan)
-# -----------------------------
-# Default install location:
-#   /opt/blackbox
-# Override by setting env var BLACKBOX_ROOT=/some/path
-ROOT = Path(os.environ.get("BLACKBOX_ROOT", "/opt/blackbox")).resolve()
-
-# Repository layout:
-#   /opt/blackbox/OLED/app.py
-#   /opt/blackbox/OLED/Modules/<module>/module.json
-APP_DIR = ROOT / "OLED"
-MODULE_DIR = APP_DIR / "Modules"
-LOG_DIR = APP_DIR / "logs"
-SD_TEST_FILE = APP_DIR / ".sd_write_test"
 
 SPLASH_MIN_SECONDS = 5.0
 SPLASH_FRAME_SLEEP = 0.08
@@ -101,7 +119,7 @@ oled_init()
 # =====================================================
 def sd_write_check() -> Optional[str]:
     try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         # Errno 21 guard: if a directory exists at the test-file path, remove it.
         if SD_TEST_FILE.exists() and SD_TEST_FILE.is_dir():
@@ -363,20 +381,17 @@ def poweroff() -> None:
 # =====================================================
 def settings(consume, clear) -> None:
     clear()
-    ver = read_version()
-    did_full = read_device_id()
-    did = short_device_id(did_full)
-
     while True:
         oled_message(
             "SETTINGS",
-            [hostname(), f"IP {get_ip()}", f"v{ver} ID:{did}"],
+            [hostname(), f"IP {get_ip()}", f"UP {uptime_short()}"],
             "BACK = menu",
         )
         if consume("back"):
             clear()
             return
         time.sleep(0.1)
+
 
 # =====================================================
 # MODULE RUNNER
@@ -395,7 +410,7 @@ def run_module(mod: Module, consume, clear) -> None:
 
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
-    # Use the same interpreter as this app (systemd service should run inside venv)
+    # Use the current interpreter (systemd already launches app.py inside the venv)
     cmd = [sys.executable, mod.entry_path]
 
     log_path = log_path_for(mod.id)
@@ -520,11 +535,7 @@ def main() -> None:
 
     modules = discover_modules(MODULE_DIR)
     if not modules:
-        oled_message(
-            "NO MODULES",
-            [f"Add under {MODULE_DIR}", "", ""],
-            "HOLD=cfg",
-        )
+        oled_message("NO MODULES", [str(MODULE_DIR)[:21], "Add module folders", ""], "HOLD=cfg")
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
@@ -592,8 +603,6 @@ def main() -> None:
 
         # CRITICAL FIX:
         # Always consume/clear any BACK press event in the menu loop.
-        # Otherwise it will linger and get forwarded to the next launched module,
-        # causing the module to immediately exit with exit_code=0.
         consume("back")
 
         time.sleep(0.02)
