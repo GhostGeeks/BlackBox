@@ -167,7 +167,7 @@ def build_uap3_signature() -> None:
     # ---- FAST smoothing for breathing noise (O(n), Pi Zero friendly) ----
     klen = 64  # smoothing window
 
-def moving_average_same(x: np.ndarray, win: int) -> np.ndarray:
+def moving_average_same(x, win):
     """Moving average returning same-length output (len(y) == len(x))."""
     if win <= 1:
         return x.astype(np.float32, copy=False)
