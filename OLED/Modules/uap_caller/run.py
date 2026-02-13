@@ -8,6 +8,8 @@ import shutil
 import signal
 import threading
 import subprocess
+import selectors
+import errno
 from pathlib import Path
 from typing import Optional
 
@@ -45,17 +47,16 @@ AMP_AMBIENT = 0.20
 AMP_BREATH = 0.15
 
 BREATH_SEED = 1337
+CHUNK_SECONDS = float(os.environ.get("UAP_CHUNK_S", "0.75"))
 
-# Build chunking: smaller chunks => more UI updates; larger => fewer CPU spikes.
-CHUNK_SECONDS = float(os.environ.get("UAP_CHUNK_S", "0.75"))  # 0.5..1.0 is a good Pi range
-
-SIGNATURE_VERSION = "uap3_signature_v6_threaded_nonblocking"
+SIGNATURE_VERSION = "uap3_signature_v7_nonblocking_stdin"
 
 running = True
+stop_now = threading.Event()
+
 play_proc: Optional[subprocess.Popen] = None
 started_at: Optional[float] = None
 
-# Build thread control
 _build_thread: Optional[threading.Thread] = None
 _build_cancel = threading.Event()
 _build_lock = threading.Lock()
@@ -67,20 +68,15 @@ _last_build_progress_emit = 0.0
 # JSON-only output
 # -----------------------------
 def emit(obj: dict) -> None:
-    """
-    Send exactly one JSON object per line.
-    Never print anything else.
-    """
     try:
         sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
         sys.stdout.flush()
     except Exception:
-        # If stdout is broken, there's nowhere safe to report.
         pass
 
 
 # -----------------------------
-# Playback (no BT management here)
+# Playback (no BT management)
 # -----------------------------
 def _pick_player():
     if shutil.which("aplay"):
@@ -120,7 +116,7 @@ def start_playback_loop(path: Path) -> None:
     stop_playback()
     player = _pick_player()
 
-    if player and "aplay" in player[0]:
+    if "aplay" in player[0]:
         play_proc = subprocess.Popen(
             player + ["--loop=0", str(path)],
             stdout=subprocess.DEVNULL,
@@ -177,12 +173,9 @@ def _safe_unlink(p: Path) -> None:
 
 
 # -----------------------------
-# Build crafted signature (threaded + cancelable)
+# Build (threaded + cancelable)
 # -----------------------------
 def _throttled_build_emit(pct: float, step: str, start_time: float, force: bool = False) -> None:
-    """
-    Emit progress at most ~10 times/sec (prevents stdout flooding).
-    """
     global _last_build_progress_emit
     now = time.time()
     if (not force) and (now - _last_build_progress_emit) < 0.10:
@@ -199,16 +192,11 @@ def _throttled_build_emit(pct: float, step: str, start_time: float, force: bool 
 
 
 def build_uap_signature(cancel_evt: threading.Event) -> None:
-    """
-    Build the WAV file in a Pi-friendly chunked loop.
-    MUST NOT print non-JSON.
-    """
     try:
         import numpy as np
     except Exception as e:
-        raise RuntimeError("numpy missing in venv (pip install numpy)") from e
+        raise RuntimeError("numpy missing (pip install numpy)") from e
 
-    # De-prioritize build CPU vs UI
     try:
         os.nice(5)
     except Exception:
@@ -243,7 +231,6 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
         "Normalizing output",
     ]
 
-    # Ensure stale tmp doesn't confuse us
     _safe_unlink(OUT_TMP)
 
     start_time = time.time()
@@ -257,33 +244,28 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
         total_parts = chunks + (1 if remainder else 0)
 
         for c in range(total_parts):
-            if cancel_evt.is_set():
+            if cancel_evt.is_set() or stop_now.is_set():
                 raise RuntimeError("Build cancelled")
 
             cur_size = remainder if (c == chunks and remainder) else chunk_size
             chunk_start = c * chunk_size
             t0 = chunk_start / SAMPLE_RATE
 
-            # Build step label
             step = steps[min(len(steps) - 1, (c * len(steps)) // max(1, total_parts))]
             _throttled_build_emit(chunk_start / float(total_samples), step, start_time)
 
-            # Time vector
             t = (np.arange(cur_size, dtype=np.float64) / SAMPLE_RATE) + t0
 
-            # Layer 1: Schumann AM on carrier
             carrier = np.sin(2 * np.pi * CARRIER_FREQ * t)
             modulator = 0.5 * (1.0 + np.sin(2 * np.pi * SCHUMANN_FREQ * t))
             layer1 = (modulator * carrier * AMP_SCHUMANN).astype(np.float64, copy=False)
 
-            # Layer 2: harmonics
             sig = np.sin(2 * np.pi * HARMONIC_BASE_FREQ * t)
             sig += 0.3 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 2.0) * t)
             sig += 0.1 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 3.0) * t)
             wobble = 1.0 + 0.001 * np.sin(2 * np.pi * 0.1 * t)
             layer2 = (sig * wobble * AMP_HARMONIC).astype(np.float64, copy=False)
 
-            # Layer 3: pings
             ping_freq = 17000.0
             ping_dur = 0.1
             cycle5 = np.mod(t, 5.0)
@@ -293,7 +275,6 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
                 ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
             layer3 = (np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING).astype(np.float64, copy=False)
 
-            # Layer 4: chirps
             chirp_dur = 0.2
             cycle10 = np.mod(t, 10.0)
             chirp_mask = cycle10 < chirp_dur
@@ -308,7 +289,6 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
                 chirp[chirp_mask] = np.sin(phase) * env
             layer4 = (chirp * AMP_CHIRP).astype(np.float64, copy=False)
 
-            # Layer 5: ambient pad
             pad = np.sin(2 * np.pi * AMBIENT_BASE_FREQ * t)
             pad += 0.5 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 1.5) * t + 0.3)
             pad += 0.25 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.0) * t + 0.7)
@@ -316,14 +296,13 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
             mod = 0.8 + 0.2 * np.sin(2 * np.pi * 0.1 * t)
             layer5 = (pad * mod * AMP_AMBIENT).astype(np.float64, copy=False)
 
-            # Layer 6: breathing noise
             noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32, copy=False)
             filtered = moving_average_same(noise, klen)
             cycleB = np.mod(t, 5.0)
             envB = np.zeros_like(t, dtype=np.float64)
             inhale = cycleB < 2.0
-            envB[inhale] = np.sin(np.pi * cycleB[inhale] / 4.0) ** 2
-            envB[~inhale] = np.cos(np.pi * (cycleB[~inhale] - 2.0) / 6.0) ** 2
+            envB[inhale] = (np.sin(np.pi * cycleB[inhale] / 4.0) ** 2)
+            envB[~inhale] = (np.cos(np.pi * (cycleB[~inhale] - 2.0) / 6.0) ** 2)
             layer6 = (filtered.astype(np.float64, copy=False) * envB * AMP_BREATH).astype(np.float64, copy=False)
 
             mixed = layer1 + layer2 + layer3 + layer4 + layer5 + layer6
@@ -338,7 +317,6 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
             done = chunk_start + cur_size
             _throttled_build_emit(done / float(total_samples), step, start_time)
 
-            # Cooperative yield so we don't starve the system
             if (c % 2) == 0:
                 time.sleep(0.001)
 
@@ -367,14 +345,10 @@ def _set_building(val: bool) -> None:
 
 
 def start_build_async(force_rebuild: bool) -> None:
-    """
-    Starts a build thread if not already building.
-    If force_rebuild, deletes cache first.
-    """
     global _build_thread
+
     with _build_lock:
         if _build_thread is not None and _build_thread.is_alive():
-            # already building
             return
 
         _build_cancel.clear()
@@ -392,11 +366,12 @@ def start_build_async(force_rebuild: bool) -> None:
             try:
                 build_uap_signature(_build_cancel)
             except Exception as e:
-                emit({"type": "fatal", "message": f"Build failed: {e}"})
+                # If we were cancelled as part of shutdown, don't scream fatal
+                if not (stop_now.is_set() or _build_cancel.is_set()):
+                    emit({"type": "fatal", "message": f"Build failed: {e}"})
             finally:
                 _set_building(False)
-                # If build succeeded, move to playback page automatically
-                if signature_is_ready() and not _build_cancel.is_set():
+                if signature_is_ready() and not (_build_cancel.is_set() or stop_now.is_set()):
                     emit({"type": "page", "name": "playback"})
                     send_state()
 
@@ -405,8 +380,7 @@ def start_build_async(force_rebuild: bool) -> None:
 
 
 # -----------------------------
-# Button protocol from app.py
-# up, down, select, select_hold, back
+# Command handling
 # -----------------------------
 def handle_cmd(cmd: str) -> None:
     cmd = (cmd or "").strip().lower()
@@ -415,7 +389,6 @@ def handle_cmd(cmd: str) -> None:
 
     if cmd == "select":
         if _building:
-            # During build, select toggles nothing; just re-emit state
             send_state()
             return
 
@@ -431,66 +404,112 @@ def handle_cmd(cmd: str) -> None:
         return
 
     if cmd == "select_hold":
-        # Force rebuild
         start_build_async(force_rebuild=True)
         return
 
     if cmd == "back":
-        # Cancel build (if running) and exit
         _build_cancel.set()
         stop_playback()
         emit({"type": "exit"})
-        raise SystemExit(0)
-
-    # Ignore up/down for now
-    if cmd in ("up", "down"):
+        stop_now.set()
         return
+
+    # up/down ignored
+    return
 
 
 # -----------------------------
-# Signals
+# Signals (must stop promptly)
 # -----------------------------
 def _sig_handler(signum, frame):
     global running
     running = False
+    stop_now.set()
     _build_cancel.set()
     stop_playback()
+    # Do NOT block here. Loop will exit quickly.
+    # Also emit exit so parent can clean up.
+    emit({"type": "exit"})
 
 
 signal.signal(signal.SIGINT, _sig_handler)
 signal.signal(signal.SIGTERM, _sig_handler)
 
 
+# -----------------------------
+# Non-blocking stdin loop
+# -----------------------------
+def _setup_nonblocking_stdin(sel: selectors.BaseSelector):
+    fd = sys.stdin.fileno()
+    os.set_blocking(fd, False)
+    sel.register(fd, selectors.EVENT_READ)
+    return fd
+
+
 def main() -> int:
     emit({"type": "hello", "module": "uap_caller", "version": SIGNATURE_VERSION})
 
-    # Preflight player
     try:
         _pick_player()
     except Exception as e:
         emit({"type": "fatal", "message": str(e)})
+        emit({"type": "exit"})
         return 2
 
-    # Build on initial load (async so stdin still works)
     if not signature_is_ready():
         start_build_async(force_rebuild=False)
     else:
         emit({"type": "page", "name": "playback"})
         send_state()
 
-    # Main command loop
-    while running:
-        line = sys.stdin.readline()
-        if line == "":
-            break
-        try:
-            handle_cmd(line)
-        except SystemExit:
-            break
-        except Exception as e:
-            emit({"type": "fatal", "message": f"Runtime error: {e}"})
-            break
+    sel = selectors.DefaultSelector()
+    fd = _setup_nonblocking_stdin(sel)
+    buf = bytearray()
 
+    last_state_emit = 0.0
+
+    while running and not stop_now.is_set():
+        # Periodic state updates so launcher UI stays fresh during playback
+        now = time.time()
+        if (now - last_state_emit) >= 0.25:
+            send_state()
+            last_state_emit = now
+
+        events = sel.select(timeout=0.1)
+        if not events:
+            continue
+
+        for key, _mask in events:
+            if key.fd != fd:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                stop_now.set()
+                break
+
+            if not chunk:
+                # stdin closed -> exit
+                stop_now.set()
+                break
+
+            buf.extend(chunk)
+            while b"\n" in buf:
+                line, _, rest = buf.partition(b"\n")
+                buf = bytearray(rest)
+                try:
+                    handle_cmd(line.decode("utf-8", errors="ignore"))
+                except Exception as e:
+                    emit({"type": "fatal", "message": f"Runtime error: {e}"})
+                    stop_now.set()
+                    break
+
+    # shutdown
+    stop_now.set()
     _build_cancel.set()
     stop_playback()
     emit({"type": "exit"})
