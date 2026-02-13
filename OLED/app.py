@@ -771,15 +771,12 @@ def run_module(mod: Module, consume, clear) -> None:
     """
     ensure_dirs()
 
-    # Clear/drain BEFORE launch so stale BACK never gets forwarded.
     clear()
     drain_events(consume, seconds=0.20)
 
-    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
-
     cmd = [sys.executable, mod.entry_path]
-
     log_path = log_path_for(mod.id)
+
     try:
         logf = open(log_path, "w", buffering=1)
     except Exception:
@@ -794,7 +791,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
     log(f"[launcher] cmd={cmd!r}")
 
-    # --- Special case: UAP Caller uses JSON stdout for UI ---
     is_uap = (mod.id == "uap_caller")
 
     try:
@@ -828,7 +824,7 @@ def run_module(mod: Module, consume, clear) -> None:
             pass
 
     # -----------------------------
-    # UAP Caller headless JSON UI
+    # UAP Caller: app owns OLED; module emits JSON status on stdout
     # -----------------------------
     if is_uap:
         out_sel = selectors.DefaultSelector()
@@ -853,37 +849,43 @@ def run_module(mod: Module, consume, clear) -> None:
         def draw_playback() -> None:
             mm, ss = divmod(int(state["elapsed_s"]), 60)
             st = "PLAYING" if state["playing"] else "READY"
-            oled_message(
-                "UAP Caller",
-                [st, f"Time {mm:02d}:{ss:02d}"],
-                "SEL=Play BACK",
-            )
+            oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play BACK")
 
         def pump_stdout() -> None:
+            # Drain EVERYTHING available; never stop on non-JSON lines.
             for key, _ in out_sel.select(timeout=0):
-                line = key.fileobj.readline()
-                if not line:
-                    return
-                log(line.rstrip())
-                try:
-                    msg = json.loads(line)
-                except Exception:
-                    continue
+                while True:
+                    try:
+                        line = key.fileobj.readline()
+                    except Exception:
+                        return
+                    if not line:
+                        return
 
-                t = msg.get("type")
-                if t == "page":
-                    state["page"] = msg.get("name", state["page"])
-                elif t == "build":
-                    state["build_pct"] = float(msg.get("pct", state["build_pct"]))
-                    state["build_step"] = str(msg.get("step", state["build_step"]))
-                elif t == "state":
-                    state["playing"] = bool(msg.get("playing", state["playing"]))
-                    state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
-                elif t == "fatal":
-                    state["page"] = "fatal"
-                    state["build_step"] = str(msg.get("message", "fatal"))[:21]
+                    log(f"[child] {line.rstrip()}")
 
-        # Run loop while module is alive
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        # Not JSON? ignore and keep draining.
+                        continue
+
+                    t = msg.get("type")
+                    if t == "page":
+                        state["page"] = msg.get("name", state["page"])
+                    elif t == "build":
+                        state["build_pct"] = float(msg.get("pct", state["build_pct"]))
+                        state["build_step"] = str(msg.get("step", state["build_step"]))
+                        state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+                    elif t == "state":
+                        state["playing"] = bool(msg.get("playing", state["playing"]))
+                        state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+                    elif t == "fatal":
+                        state["page"] = "fatal"
+                        state["build_step"] = str(msg.get("message", "fatal"))[:21]
+                    elif t == "exit":
+                        pass
+
         while proc.poll() is None:
             pump_stdout()
 
@@ -905,7 +907,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
             if consume("back"):
                 send("back")
-                # give it a moment to exit cleanly
                 for _ in range(40):
                     if proc.poll() is not None:
                         break
@@ -919,7 +920,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
             time.sleep(0.02)
 
-        # Cleanup selector + stdout
         try:
             if proc.stdout:
                 try:
@@ -931,7 +931,7 @@ def run_module(mod: Module, consume, clear) -> None:
             pass
 
     # -----------------------------
-    # Default module runner (classic)
+    # Default modules: classic runner
     # -----------------------------
     else:
         while proc.poll() is None:
@@ -959,14 +959,12 @@ def run_module(mod: Module, consume, clear) -> None:
 
             time.sleep(0.02)
 
-    # cleanup stdin
     try:
         if proc.stdin:
             proc.stdin.close()
     except Exception:
         pass
 
-    # wait a bit; force kill if needed
     try:
         proc.wait(timeout=1.0)
     except Exception:
@@ -985,135 +983,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
     clear()
     drain_events(consume, seconds=0.30)
-    oled_hard_wake()
-
-    # -----------------------------
-    # Module UI state (UAP Caller headless JSON stdout)
-    # app.py owns OLED; module emits JSON lines on stdout.
-    # -----------------------------
-    out_sel = selectors.DefaultSelector()
-    if proc.stdout:
-        out_sel.register(proc.stdout, selectors.EVENT_READ)
-
-    state = {
-        "page": "build",
-        "build_pct": 0.0,
-        "build_step": "",
-        "playing": False,
-        "elapsed_s": 0,
-    }
-
-    def draw_build() -> None:
-        oled_message(
-            "UAP Call Sig",
-            [state["build_step"], f"{int(state['build_pct']*100):3d}%"],
-            "Loading..."
-        )
-
-    def draw_playback() -> None:
-        mm, ss = divmod(int(state["elapsed_s"]), 60)
-        st = "PLAYING" if state["playing"] else "READY"
-        oled_message(
-            "UAP Caller",
-            [st, f"Time {mm:02d}:{ss:02d}"],
-            "SEL=Play  BACK"
-        )
-
-    def pump_stdout() -> None:
-        for key, _ in out_sel.select(timeout=0):
-            line = key.fileobj.readline()
-            if not line:
-                return
-
-            log("[child] " + line.rstrip())
-
-            try:
-                msg = json.loads(line)
-            except Exception:
-                continue  # <-- don't abort on non-JSON lines
-
-            t = msg.get("type")
-            if t == "page":
-                state["page"] = msg.get("name", state["page"])
-            elif t == "build":
-                state["build_pct"] = float(msg.get("pct", state["build_pct"]))
-                state["build_step"] = str(msg.get("step", state["build_step"]))
-            elif t == "state":
-                state["playing"] = bool(msg.get("playing", state["playing"]))
-                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
-            elif t == "fatal":
-                state["page"] = "fatal"
-                state["build_step"] = str(msg.get("message", "fatal"))[:21]
-            elif t == "exit":
-                pass
-
-
-    # Run loop while module is alive
-    while proc.poll() is None:
-        # Pump module stdout and render module UI
-        pump_stdout()
-        if state.get('page') == 'build':
-            draw_build()
-        elif state.get('page') == 'fatal':
-            oled_message('UAP Caller', ['ERROR', state.get('build_step','')], 'BACK')
-        else:
-            draw_playback()
-
-        if consume("up"):
-            send("up")
-        if consume("down"):
-            send("down")
-        if consume("select"):
-            send("select")
-        if consume("select_hold"):
-            send("select_hold")
-
-        if consume("back"):
-            send("back")
-            # give it a moment to exit cleanly
-            for _ in range(40):
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.02)
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            break
-
-        time.sleep(0.02)
-
-    # cleanup stdin
-    try:
-        if proc.stdin:
-            proc.stdin.close()
-    except Exception:
-        pass
-
-    # wait a bit; force kill if needed
-    try:
-        proc.wait(timeout=1.0)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-    exit_code = proc.returncode
-    log(f"[launcher] exit_code={exit_code}")
-
-    if logf:
-        try:
-            logf.close()
-        except Exception:
-            pass
-
-    # Clear and drain AGAIN after return
-    clear()
-    drain_events(consume, seconds=0.30)
-
-    # Child may have left OLED off; recover here
     oled_hard_wake()
 
 # =====================================================

@@ -175,16 +175,10 @@ def build_uap3_signature() -> None:
         """Moving average returning same-length output (len(y) == len(x))."""
         if win <= 1:
             return x.astype(np.float32, copy=False)
-
         pad_left = win // 2
         pad_right = win - 1 - pad_left
-
-        # pad to keep output == input length
         xpad = np.pad(x, (pad_left, pad_right), mode="edge").astype(np.float64, copy=False)
-
-        # prepend 0 so the windowed diff yields len(x) samples
         c = np.cumsum(np.concatenate(([0.0], xpad)), dtype=np.float64)
-
         y = (c[win:] - c[:-win]) / float(win)  # length == len(x)
         return y.astype(np.float32, copy=False)
 
@@ -213,19 +207,28 @@ def build_uap3_signature() -> None:
             t0 = chunk_start / SAMPLE_RATE
             t = (np.arange(cur_size, dtype=np.float64) / SAMPLE_RATE) + t0
 
-            # Layer 1: Schumann AM on 100Hz carrier
+            # UI heartbeat at chunk start (prevents "frozen" perception)
+            step = steps[(c // 2) % len(steps)]
+            emit({
+                "type": "build",
+                "pct": chunk_start / float(total_samples),
+                "step": step,
+                "elapsed_s": int(time.time() - start_time),
+            })
+
+            # Layer 1
             carrier = np.sin(2 * np.pi * CARRIER_FREQ * t)
             modulator = 0.5 * (1.0 + np.sin(2 * np.pi * SCHUMANN_FREQ * t))
             layer1 = modulator * carrier * AMP_SCHUMANN
 
-            # Layer 2: 528Hz + harmonics
+            # Layer 2
             sig = np.sin(2 * np.pi * HARMONIC_BASE_FREQ * t)
             sig += 0.3 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 2.0) * t)
             sig += 0.1 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 3.0) * t)
             wobble = 1.0 + 0.001 * np.sin(2 * np.pi * 0.1 * t)
             layer2 = sig * wobble * AMP_HARMONIC
 
-            # Layer 3: 17kHz pings every 5s
+            # Layer 3
             ping_freq = 17000.0
             ping_dur = 0.1
             cycle5 = np.mod(t, 5.0)
@@ -234,7 +237,7 @@ def build_uap3_signature() -> None:
             ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
             layer3 = np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING
 
-            # Layer 4: chirps every 10s (2k->3k over 0.2s)
+            # Layer 4
             chirp_dur = 0.2
             cycle10 = np.mod(t, 10.0)
             chirp_mask = cycle10 < chirp_dur
@@ -249,7 +252,7 @@ def build_uap3_signature() -> None:
                 chirp[chirp_mask] = np.sin(phase) * env
             layer4 = chirp * AMP_CHIRP
 
-            # Layer 5: ambient pad at 432Hz with harmonics
+            # Layer 5
             pad = np.sin(2 * np.pi * AMBIENT_BASE_FREQ * t)
             pad += 0.5 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 1.5) * t + 0.3)
             pad += 0.25 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.0) * t + 0.7)
@@ -257,7 +260,7 @@ def build_uap3_signature() -> None:
             mod = 0.8 + 0.2 * np.sin(2 * np.pi * 0.1 * t)
             layer5 = pad * mod * AMP_AMBIENT
 
-            # Layer 6: breathing noise (deterministic)
+            # Layer 6
             noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32)
             filtered = moving_average_same(noise, klen)
             cycleB = np.mod(t, 5.0)
@@ -270,7 +273,6 @@ def build_uap3_signature() -> None:
 
             mixed = layer1 + layer2 + layer3 + layer4 + layer5 + layer6
 
-            # Normalize if needed
             max_amp = float(np.max(np.abs(mixed))) if mixed.size else 0.0
             if max_amp > 0.95:
                 mixed = mixed * (0.95 / max_amp)
@@ -279,14 +281,15 @@ def build_uap3_signature() -> None:
             wf.writeframes(pcm.tobytes())
 
             done = chunk_start + cur_size
-            pct = done / float(total_samples)
-            elapsed = int(time.time() - start_time)
-            step = steps[(c // 2) % len(steps)]
-            emit({"type": "build", "pct": pct, "step": step, "elapsed_s": elapsed})
+            emit({
+                "type": "build",
+                "pct": done / float(total_samples),
+                "step": step,
+                "elapsed_s": int(time.time() - start_time),
+            })
 
     OUT_TMP.replace(OUT_WAV)
     write_meta()
-
 
 def send_state() -> None:
     emit(
