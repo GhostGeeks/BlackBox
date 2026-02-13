@@ -868,7 +868,7 @@ def run_module(mod: Module, consume, clear) -> None:
                 try:
                     msg = json.loads(line)
                 except Exception:
-                    return
+                    continue
 
                 t = msg.get("type")
                 if t == "page":
