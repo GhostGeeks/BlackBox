@@ -771,11 +771,12 @@ def run_module(mod: Module, consume, clear) -> None:
     """
     ensure_dirs()
 
-    # CRITICAL: clear/drain BEFORE launch so stale BACK never gets forwarded.
+    # Clear/drain BEFORE launch so stale BACK never gets forwarded.
     clear()
     drain_events(consume, seconds=0.20)
 
-    # Use the current interpreter (systemd already launches app.py inside the venv)
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
+
     cmd = [sys.executable, mod.entry_path]
 
     log_path = log_path_for(mod.id)
@@ -793,19 +794,21 @@ def run_module(mod: Module, consume, clear) -> None:
 
     log(f"[launcher] cmd={cmd!r}")
 
+    # --- Special case: UAP Caller uses JSON stdout for UI ---
+    is_uap = (mod.id == "uap_caller")
+
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.PIPE if is_uap else (logf if logf else subprocess.DEVNULL),
             stderr=logf if logf else subprocess.DEVNULL,
-
             text=True,
             bufsize=1,
         )
     except Exception as e:
+        log(f"[launcher] failed_to_start: {e!r}")
         if logf:
-            log(f"[launcher] failed_to_start: {e!r}")
             try:
                 logf.close()
             except Exception:
@@ -824,6 +827,165 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
+    # -----------------------------
+    # UAP Caller headless JSON UI
+    # -----------------------------
+    if is_uap:
+        out_sel = selectors.DefaultSelector()
+        if proc.stdout:
+            out_sel.register(proc.stdout, selectors.EVENT_READ)
+
+        state = {
+            "page": "build",
+            "build_pct": 0.0,
+            "build_step": "",
+            "playing": False,
+            "elapsed_s": 0,
+        }
+
+        def draw_build() -> None:
+            oled_message(
+                "UAP Call Sig",
+                [state["build_step"][:21], f"{int(state['build_pct']*100):3d}%"],
+                "Loading...",
+            )
+
+        def draw_playback() -> None:
+            mm, ss = divmod(int(state["elapsed_s"]), 60)
+            st = "PLAYING" if state["playing"] else "READY"
+            oled_message(
+                "UAP Caller",
+                [st, f"Time {mm:02d}:{ss:02d}"],
+                "SEL=Play BACK",
+            )
+
+        def pump_stdout() -> None:
+            for key, _ in out_sel.select(timeout=0):
+                line = key.fileobj.readline()
+                if not line:
+                    return
+                log(line.rstrip())
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    return
+
+                t = msg.get("type")
+                if t == "page":
+                    state["page"] = msg.get("name", state["page"])
+                elif t == "build":
+                    state["build_pct"] = float(msg.get("pct", state["build_pct"]))
+                    state["build_step"] = str(msg.get("step", state["build_step"]))
+                elif t == "state":
+                    state["playing"] = bool(msg.get("playing", state["playing"]))
+                    state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+                elif t == "fatal":
+                    state["page"] = "fatal"
+                    state["build_step"] = str(msg.get("message", "fatal"))[:21]
+
+        # Run loop while module is alive
+        while proc.poll() is None:
+            pump_stdout()
+
+            if state.get("page") == "build":
+                draw_build()
+            elif state.get("page") == "fatal":
+                oled_message("UAP Caller", ["ERROR", state.get("build_step", "")], "BACK")
+            else:
+                draw_playback()
+
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+            if consume("select"):
+                send("select")
+            if consume("select_hold"):
+                send("select_hold")
+
+            if consume("back"):
+                send("back")
+                # give it a moment to exit cleanly
+                for _ in range(40):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            time.sleep(0.02)
+
+        # Cleanup selector + stdout
+        try:
+            if proc.stdout:
+                try:
+                    out_sel.unregister(proc.stdout)
+                except Exception:
+                    pass
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Default module runner (classic)
+    # -----------------------------
+    else:
+        while proc.poll() is None:
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+            if consume("select"):
+                send("select")
+            if consume("select_hold"):
+                send("select_hold")
+
+            if consume("back"):
+                send("back")
+                for _ in range(40):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            time.sleep(0.02)
+
+    # cleanup stdin
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    # wait a bit; force kill if needed
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    log(f"[launcher] exit_code={proc.returncode}")
+
+    if logf:
+        try:
+            logf.close()
+        except Exception:
+            pass
+
+    clear()
+    drain_events(consume, seconds=0.30)
+    oled_hard_wake()
 
     # -----------------------------
     # Module UI state (UAP Caller headless JSON stdout)

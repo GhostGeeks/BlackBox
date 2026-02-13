@@ -171,15 +171,24 @@ def build_uap3_signature() -> None:
     # FAST smoothing for breathing noise (O(n))
     klen = 64
 
+        # FAST smoothing for breathing noise (O(n))
+    klen = 64
+
     def moving_average_same(x, win):
-        """Moving average returning len(x) output."""
+        """Moving average returning same-length output (len(y) == len(x))."""
         if win <= 1:
             return x.astype(np.float32, copy=False)
+
         pad_left = win // 2
         pad_right = win - 1 - pad_left
+
+        # pad to keep output == input length
         xpad = np.pad(x, (pad_left, pad_right), mode="edge").astype(np.float64, copy=False)
+
+        # prepend 0 so the windowed diff yields len(x) samples
         c = np.cumsum(np.concatenate(([0.0], xpad)), dtype=np.float64)
-        y = (c[win:] - c[:-win]) / float(win)  # len == len(x)
+
+        y = (c[win:] - c[:-win]) / float(win)  # length == len(x)
         return y.astype(np.float32, copy=False)
 
     steps = [
