@@ -167,16 +167,21 @@ def build_uap3_signature() -> None:
     # ---- FAST smoothing for breathing noise (O(n), Pi Zero friendly) ----
     klen = 64  # smoothing window
 
-    def moving_average_same(x: np.ndarray, win: int) -> np.ndarray:
-        """Cheap smoothing: moving average with 'same' output length, O(n)."""
-        if win <= 1:
-            return x.astype(np.float32, copy=False)
-        pad_left = win // 2
-        pad_right = win - 1 - pad_left
-        xpad = np.pad(x, (pad_left, pad_right), mode="edge")
-        c = np.cumsum(xpad, dtype=np.float64)
-        y = (c[win:] - c[:-win]) / float(win)
-        return y.astype(np.float32, copy=False)
+def moving_average_same(x: np.ndarray, win: int) -> np.ndarray:
+    """Moving average returning same-length output (len(y) == len(x))."""
+    if win <= 1:
+        return x.astype(np.float32, copy=False)
+
+    pad_left = win // 2
+    pad_right = win - 1 - pad_left
+
+    xpad = np.pad(x, (pad_left, pad_right), mode="edge").astype(np.float64, copy=False)
+
+    # Prepend 0 so windowed difference produces len(x) samples (not len(x)-1)
+    c = np.cumsum(np.concatenate(([0.0], xpad)), dtype=np.float64)
+
+    y = (c[win:] - c[:-win]) / float(win)   # length == len(x)
+    return y.astype(np.float32, copy=False)
 
     steps = [
         "Installing harmonics",
