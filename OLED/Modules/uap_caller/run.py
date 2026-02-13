@@ -29,7 +29,7 @@ CHANNELS = 1
 SAMPWIDTH_BYTES = 2
 
 # 10-min master signature (loop playback for continuous operation)
-DEFAULT_DURATION_S = 600
+DEFAULT_DURATION_S = 180
 DURATION_S = int(os.environ.get("UAP_DURATION_S", str(DEFAULT_DURATION_S)))
 
 # Crafted layer settings (from your base generator)
@@ -164,9 +164,19 @@ def build_uap3_signature() -> None:
 
     rng = np.random.default_rng(BREATH_SEED)
 
-    # cheap smoothing for breathing noise
-    klen = 64
-    kernel = np.ones(klen, dtype=np.float32) / float(klen)
+    # ---- FAST smoothing for breathing noise (O(n), Pi Zero friendly) ----
+    klen = 64  # smoothing window
+
+    def moving_average_same(x: np.ndarray, win: int) -> np.ndarray:
+        """Cheap smoothing: moving average with 'same' output length, O(n)."""
+        if win <= 1:
+            return x.astype(np.float32, copy=False)
+        pad_left = win // 2
+        pad_right = win - 1 - pad_left
+        xpad = np.pad(x, (pad_left, pad_right), mode="edge")
+        c = np.cumsum(xpad, dtype=np.float64)
+        y = (c[win:] - c[:-win]) / float(win)
+        return y.astype(np.float32, copy=False)
 
     steps = [
         "Installing harmonics",
@@ -239,7 +249,7 @@ def build_uap3_signature() -> None:
 
             # Layer 6 breathing noise
             noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32)
-            filtered = np.convolve(noise, kernel, mode="same").astype(np.float32)
+            filtered = moving_average_same(noise, klen)
             cycleB = np.mod(t, 5.0)
             envB = np.zeros_like(t, dtype=np.float64)
             inhale = cycleB < 2.0
@@ -265,7 +275,6 @@ def build_uap3_signature() -> None:
 
     OUT_TMP.replace(OUT_WAV)
     write_meta()
-
 
 def send_state() -> None:
     emit({
