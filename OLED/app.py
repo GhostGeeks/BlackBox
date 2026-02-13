@@ -590,6 +590,80 @@ def splash() -> None:
 
         time.sleep(SPLASH_FRAME_SLEEP)
 
+def startup_sequence(consume, clear) -> None:
+    """
+    Instrument-style boot sequence with real checks.
+    Keeps it short and purposeful.
+    """
+    clear()
+    drain_events(consume, seconds=0.10)
+
+    # Step 1: BOOT
+    t0 = time.time()
+    while time.time() - t0 < 0.9:
+        oled_guard()
+        with canvas(device) as draw:
+            draw.text((0, 0), PRODUCT_NAME[:21], fill=255)
+            draw.text((OLED_W - (len(VERSION) * 6), 0), VERSION, fill=255)
+            draw.line((0, 12, 127, 12), fill=255)
+            draw.text((0, 18), "INITIALIZING...", fill=255)
+            draw_progress(draw, (time.time() - t0) / 0.9)
+        time.sleep(0.05)
+
+    # Step 2: SELF TEST (do real checks)
+    sd_err = sd_write_check()
+    i2c_ok = True
+    try:
+        oled_hard_wake()
+    except Exception:
+        i2c_ok = False
+
+    oled_message(
+        "SELF TEST",
+        [
+            f"OLED {'OK' if i2c_ok else 'FAIL'}",
+            f"SD  {'OK' if sd_err is None else 'FAIL'}",
+            "BTN READY",
+        ],
+        "",
+    )
+    time.sleep(1.2)
+
+    # Step 3: RADIOS (wait briefly for Wi-Fi + attempt BT)
+    # Wi-Fi: give it a short window; we no longer need the old "splash wait for IP" behavior
+    t1 = time.time()
+    ip = ""
+    while time.time() - t1 < 2.5:
+        ip = get_ip()
+        oled_guard()
+        with canvas(device) as draw:
+            draw.text((0, 0), "RADIOS", fill=255)
+            draw.line((0, 12, 127, 12), fill=255)
+            draw.text((0, 18), f"WIFI {'OK' if ip else '...'}", fill=255)
+            draw.text((0, 30), "BT   ...", fill=255)
+            draw_progress(draw, min(1.0, (time.time() - t1) / 2.5))
+        if ip:
+            break
+        time.sleep(0.1)
+
+    # BT autoconnect with UI (already shows its own screen briefly)
+    bt_ok = bluetooth_autoconnect_ui()
+
+    # Step 4: READY
+    oled_message(
+        "READY",
+        [
+            f"WIFI {'OK' if get_ip() else 'OFF'}",
+            f"AUDIO {'BT' if bt_ok else 'LOCAL'}",
+            "",
+        ],
+        "",
+    )
+    time.sleep(0.7)
+
+    clear()
+    drain_events(consume, seconds=0.10)
+
 
 def draw_menu(mods: List[Module], idx: int) -> None:
     status_refresh(force=False)
@@ -620,6 +694,15 @@ def draw_menu(mods: List[Module], idx: int) -> None:
             draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
 
         draw.text((0, 52), "SEL=run  HOLD=cfg", fill=255)
+
+
+def draw_progress(draw, pct: float) -> None:
+    # pct 0.0..1.0
+    x0, y0, x1, y1 = 8, 54, 120, 62
+    draw.rectangle((x0, y0, x1, y1), outline=255, fill=0)
+    w = int((x1 - x0 - 2) * max(0.0, min(1.0, pct)))
+    draw.rectangle((x0 + 1, y0 + 1, x0 + 1 + w, y1 - 1), outline=255, fill=255)
+
 
 
 # =====================================================
@@ -814,18 +897,7 @@ def main() -> None:
     consume, clear, buttons = init_buttons()
     btn_up, btn_down, btn_select, btn_back = buttons
 
-    splash()
-
-    status_refresh(force=True)
-
-    # Attempt BT autoconnect AFTER splash, BEFORE menu
-    # (quick, timeout-limited, continues either way)
-    clear()
-    drain_events(consume, seconds=0.10)
-    bluetooth_autoconnect_ui()
-    clear()
-    drain_events(consume, seconds=0.10)
-
+    startup_sequence(consume, clear)
     status_refresh(force=True)
 
     modules = discover_modules(MODULE_DIR)
