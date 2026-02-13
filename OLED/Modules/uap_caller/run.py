@@ -6,6 +6,7 @@ import json
 import wave
 import shutil
 import signal
+import threading
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -28,10 +29,9 @@ SAMPLE_RATE = 44100
 CHANNELS = 1
 SAMPWIDTH_BYTES = 2
 
-DEFAULT_DURATION_S = 180  # looped signature
+DEFAULT_DURATION_S = 180
 DURATION_S = int(os.environ.get("UAP_DURATION_S", str(DEFAULT_DURATION_S)))
 
-# Crafted layer constants
 SCHUMANN_FREQ = 7.83
 CARRIER_FREQ = 100.0
 HARMONIC_BASE_FREQ = 528.0
@@ -46,22 +46,36 @@ AMP_BREATH = 0.15
 
 BREATH_SEED = 1337
 
-# Smaller chunk for frequent UI updates (prevents "stalled" look)
-CHUNK_SECONDS = 1
+# Build chunking: smaller chunks => more UI updates; larger => fewer CPU spikes.
+CHUNK_SECONDS = float(os.environ.get("UAP_CHUNK_S", "0.75"))  # 0.5..1.0 is a good Pi range
 
-SIGNATURE_VERSION = "uap3_signature_v5_headless_safe"
+SIGNATURE_VERSION = "uap3_signature_v6_threaded_nonblocking"
 
 running = True
 play_proc: Optional[subprocess.Popen] = None
 started_at: Optional[float] = None
 
+# Build thread control
+_build_thread: Optional[threading.Thread] = None
+_build_cancel = threading.Event()
+_build_lock = threading.Lock()
+_building = False
+_last_build_progress_emit = 0.0
 
+
+# -----------------------------
+# JSON-only output
+# -----------------------------
 def emit(obj: dict) -> None:
-    """Send status to app.py (one JSON object per line)."""
+    """
+    Send exactly one JSON object per line.
+    Never print anything else.
+    """
     try:
-        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
         sys.stdout.flush()
     except Exception:
+        # If stdout is broken, there's nowhere safe to report.
         pass
 
 
@@ -113,7 +127,6 @@ def start_playback_loop(path: Path) -> None:
             stderr=subprocess.DEVNULL,
         )
     else:
-        # paplay doesn't loop; keep simple
         play_proc = subprocess.Popen(
             player + [str(path)],
             stdout=subprocess.DEVNULL,
@@ -155,23 +168,58 @@ def write_meta() -> None:
     )
 
 
+def _safe_unlink(p: Path) -> None:
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
 # -----------------------------
-# Build crafted signature
+# Build crafted signature (threaded + cancelable)
 # -----------------------------
-def build_uap3_signature() -> None:
+def _throttled_build_emit(pct: float, step: str, start_time: float, force: bool = False) -> None:
+    """
+    Emit progress at most ~10 times/sec (prevents stdout flooding).
+    """
+    global _last_build_progress_emit
+    now = time.time()
+    if (not force) and (now - _last_build_progress_emit) < 0.10:
+        return
+    _last_build_progress_emit = now
+    emit(
+        {
+            "type": "build",
+            "pct": max(0.0, min(1.0, float(pct))),
+            "step": str(step),
+            "elapsed_s": int(now - start_time),
+        }
+    )
+
+
+def build_uap_signature(cancel_evt: threading.Event) -> None:
+    """
+    Build the WAV file in a Pi-friendly chunked loop.
+    MUST NOT print non-JSON.
+    """
     try:
         import numpy as np
     except Exception as e:
         raise RuntimeError("numpy missing in venv (pip install numpy)") from e
 
+    # De-prioritize build CPU vs UI
+    try:
+        os.nice(5)
+    except Exception:
+        pass
+
     total_samples = int(DURATION_S * SAMPLE_RATE)
-    chunk_size = int(CHUNK_SECONDS * SAMPLE_RATE)
+    chunk_size = max(512, int(CHUNK_SECONDS * SAMPLE_RATE))
     chunks = total_samples // chunk_size
     remainder = total_samples % chunk_size
 
     rng = np.random.default_rng(BREATH_SEED)
-
-    # Moving average smoothing (O(n)), float32 throughout
     klen = 64
 
     def moving_average_same(x_f32, win: int):
@@ -181,7 +229,7 @@ def build_uap3_signature() -> None:
         pad_right = win - 1 - pad_left
         xpad = np.pad(x_f32, (pad_left, pad_right), mode="edge").astype(np.float64, copy=False)
         c = np.cumsum(np.concatenate(([0.0], xpad)), dtype=np.float64)
-        y = (c[win:] - c[:-win]) / float(win)  # len == len(x)
+        y = (c[win:] - c[:-win]) / float(win)
         return y.astype(np.float32, copy=False)
 
     steps = [
@@ -196,13 +244,10 @@ def build_uap3_signature() -> None:
     ]
 
     # Ensure stale tmp doesn't confuse us
-    try:
-        if OUT_TMP.exists():
-            OUT_TMP.unlink()
-    except Exception:
-        pass
+    _safe_unlink(OUT_TMP)
 
     start_time = time.time()
+    _throttled_build_emit(0.0, "Starting build", start_time, force=True)
 
     with wave.open(str(OUT_TMP), "wb") as wf:
         wf.setnchannels(CHANNELS)
@@ -212,36 +257,33 @@ def build_uap3_signature() -> None:
         total_parts = chunks + (1 if remainder else 0)
 
         for c in range(total_parts):
+            if cancel_evt.is_set():
+                raise RuntimeError("Build cancelled")
+
             cur_size = remainder if (c == chunks and remainder) else chunk_size
             chunk_start = c * chunk_size
             t0 = chunk_start / SAMPLE_RATE
 
-            # Time vector float32 is fine; use float64 for sin math only where needed
+            # Build step label
+            step = steps[min(len(steps) - 1, (c * len(steps)) // max(1, total_parts))]
+            _throttled_build_emit(chunk_start / float(total_samples), step, start_time)
+
+            # Time vector
             t = (np.arange(cur_size, dtype=np.float64) / SAMPLE_RATE) + t0
 
-            step = steps[min(len(steps) - 1, (c * len(steps)) // max(1, total_parts))]
-            emit(
-                {
-                    "type": "build",
-                    "pct": chunk_start / float(total_samples),
-                    "step": step,
-                    "elapsed_s": int(time.time() - start_time),
-                }
-            )
-
-            # Layer 1: Schumann AM on 100Hz carrier
+            # Layer 1: Schumann AM on carrier
             carrier = np.sin(2 * np.pi * CARRIER_FREQ * t)
             modulator = 0.5 * (1.0 + np.sin(2 * np.pi * SCHUMANN_FREQ * t))
             layer1 = (modulator * carrier * AMP_SCHUMANN).astype(np.float64, copy=False)
 
-            # Layer 2: 528Hz + harmonics
+            # Layer 2: harmonics
             sig = np.sin(2 * np.pi * HARMONIC_BASE_FREQ * t)
             sig += 0.3 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 2.0) * t)
             sig += 0.1 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 3.0) * t)
             wobble = 1.0 + 0.001 * np.sin(2 * np.pi * 0.1 * t)
             layer2 = (sig * wobble * AMP_HARMONIC).astype(np.float64, copy=False)
 
-            # Layer 3: 17kHz pings every 5s
+            # Layer 3: pings
             ping_freq = 17000.0
             ping_dur = 0.1
             cycle5 = np.mod(t, 5.0)
@@ -251,7 +293,7 @@ def build_uap3_signature() -> None:
                 ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
             layer3 = (np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING).astype(np.float64, copy=False)
 
-            # Layer 4: chirps every 10s (2k->3k over 0.2s)
+            # Layer 4: chirps
             chirp_dur = 0.2
             cycle10 = np.mod(t, 10.0)
             chirp_mask = cycle10 < chirp_dur
@@ -266,7 +308,7 @@ def build_uap3_signature() -> None:
                 chirp[chirp_mask] = np.sin(phase) * env
             layer4 = (chirp * AMP_CHIRP).astype(np.float64, copy=False)
 
-            # Layer 5: ambient pad 432Hz with harmonics
+            # Layer 5: ambient pad
             pad = np.sin(2 * np.pi * AMBIENT_BASE_FREQ * t)
             pad += 0.5 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 1.5) * t + 0.3)
             pad += 0.25 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.0) * t + 0.7)
@@ -274,9 +316,9 @@ def build_uap3_signature() -> None:
             mod = 0.8 + 0.2 * np.sin(2 * np.pi * 0.1 * t)
             layer5 = (pad * mod * AMP_AMBIENT).astype(np.float64, copy=False)
 
-            # Layer 6: breathing noise (deterministic)
+            # Layer 6: breathing noise
             noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32, copy=False)
-            filtered = moving_average_same(noise, klen)  # float32
+            filtered = moving_average_same(noise, klen)
             cycleB = np.mod(t, 5.0)
             envB = np.zeros_like(t, dtype=np.float64)
             inhale = cycleB < 2.0
@@ -294,17 +336,15 @@ def build_uap3_signature() -> None:
             wf.writeframes(pcm.tobytes())
 
             done = chunk_start + cur_size
-            emit(
-                {
-                    "type": "build",
-                    "pct": done / float(total_samples),
-                    "step": step,
-                    "elapsed_s": int(time.time() - start_time),
-                }
-            )
+            _throttled_build_emit(done / float(total_samples), step, start_time)
+
+            # Cooperative yield so we don't starve the system
+            if (c % 2) == 0:
+                time.sleep(0.001)
 
     OUT_TMP.replace(OUT_WAV)
     write_meta()
+    _throttled_build_emit(1.0, "Build complete", start_time, force=True)
 
 
 def send_state() -> None:
@@ -315,8 +355,53 @@ def send_state() -> None:
             "playing": is_playing(),
             "elapsed_s": playback_elapsed(),
             "duration_s": DURATION_S,
+            "building": _building,
         }
     )
+
+
+def _set_building(val: bool) -> None:
+    global _building
+    with _build_lock:
+        _building = val
+
+
+def start_build_async(force_rebuild: bool) -> None:
+    """
+    Starts a build thread if not already building.
+    If force_rebuild, deletes cache first.
+    """
+    global _build_thread
+    with _build_lock:
+        if _build_thread is not None and _build_thread.is_alive():
+            # already building
+            return
+
+        _build_cancel.clear()
+        _set_building(True)
+
+        if force_rebuild:
+            stop_playback()
+            _safe_unlink(OUT_WAV)
+            _safe_unlink(META_JSON)
+            _safe_unlink(OUT_TMP)
+
+        emit({"type": "page", "name": "build"})
+
+        def _runner():
+            try:
+                build_uap_signature(_build_cancel)
+            except Exception as e:
+                emit({"type": "fatal", "message": f"Build failed: {e}"})
+            finally:
+                _set_building(False)
+                # If build succeeded, move to playback page automatically
+                if signature_is_ready() and not _build_cancel.is_set():
+                    emit({"type": "page", "name": "playback"})
+                    send_state()
+
+        _build_thread = threading.Thread(target=_runner, name="uap_build", daemon=True)
+        _build_thread.start()
 
 
 # -----------------------------
@@ -329,50 +414,37 @@ def handle_cmd(cmd: str) -> None:
         return
 
     if cmd == "select":
+        if _building:
+            # During build, select toggles nothing; just re-emit state
+            send_state()
+            return
+
         if is_playing():
             stop_playback()
         else:
             if not signature_is_ready():
-                emit({"type": "error", "message": "Signature not ready"})
-            else:
-                start_playback_loop(OUT_WAV)
+                emit({"type": "fatal", "message": "Signature not ready"})
+                return
+            start_playback_loop(OUT_WAV)
+
         send_state()
         return
 
     if cmd == "select_hold":
-        # Rebuild signature
-        stop_playback()
-        try:
-            if OUT_WAV.exists():
-                OUT_WAV.unlink()
-            if META_JSON.exists():
-                META_JSON.unlink()
-            if OUT_TMP.exists():
-                OUT_TMP.unlink()
-        except Exception:
-            pass
-
-        emit({"type": "page", "name": "build"})
-        try:
-            build_uap3_signature()
-        except Exception as e:
-            emit({"type": "fatal", "message": f"Build failed: {e}"})
-            return
-
-        emit({"type": "page", "name": "playback"})
-        send_state()
+        # Force rebuild
+        start_build_async(force_rebuild=True)
         return
 
     if cmd == "back":
+        # Cancel build (if running) and exit
+        _build_cancel.set()
         stop_playback()
         emit({"type": "exit"})
         raise SystemExit(0)
 
-    # ignore up/down for now
+    # Ignore up/down for now
     if cmd in ("up", "down"):
         return
-
-    emit({"type": "error", "message": f"Unknown cmd: {cmd}"})
 
 
 # -----------------------------
@@ -381,6 +453,7 @@ def handle_cmd(cmd: str) -> None:
 def _sig_handler(signum, frame):
     global running
     running = False
+    _build_cancel.set()
     stop_playback()
 
 
@@ -398,18 +471,14 @@ def main() -> int:
         emit({"type": "fatal", "message": str(e)})
         return 2
 
-    # Build on initial load
+    # Build on initial load (async so stdin still works)
     if not signature_is_ready():
-        emit({"type": "page", "name": "build"})
-        try:
-            build_uap3_signature()
-        except Exception as e:
-            emit({"type": "fatal", "message": f"Build failed: {e}"})
-            return 3
+        start_build_async(force_rebuild=False)
+    else:
+        emit({"type": "page", "name": "playback"})
+        send_state()
 
-    emit({"type": "page", "name": "playback"})
-    send_state()
-
+    # Main command loop
     while running:
         line = sys.stdin.readline()
         if line == "":
@@ -419,8 +488,10 @@ def main() -> int:
         except SystemExit:
             break
         except Exception as e:
-            emit({"type": "error", "message": str(e)})
+            emit({"type": "fatal", "message": f"Runtime error: {e}"})
+            break
 
+    _build_cancel.set()
     stop_playback()
     emit({"type": "exit"})
     return 0
@@ -428,4 +499,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -8,9 +8,11 @@ import math
 import json
 import selectors
 import subprocess
+import signal
+import errno
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from gpiozero import Button
@@ -44,7 +46,6 @@ MODULE_DIR_CANDIDATES = [
     ROOT_DIR / "Modules",
     ROOT_DIR / "modules",
 ]
-
 MODULE_DIR = next((p for p in MODULE_DIR_CANDIDATES if p.exists()), ROOT_DIR / "OLED" / "modules")
 
 # Logs/data kept inside install tree by default (works under /opt/blackbox with correct perms)
@@ -77,16 +78,12 @@ SPLASH_FRAME_SLEEP = 0.08
 # Menu refresh watchdog (helps recover from rare "blank menu" states)
 MENU_REFRESH_SECONDS = 2.0
 
-# Device Branding Reference
-BRAND_NAME = "CHOST GEEKS"
-
-# =====================================================
-# BRANDING
-# =====================================================
+# Branding
 PRODUCT_NAME = "BLACKBOX"
 PRODUCT_SUBTITLE = "PARANORMAL AUDIO"
 TAGLINE = "FIELD UNIT"
-VERSION = "v0.9"  # bump as you like
+VERSION = "v0.9"
+
 
 # =====================================================
 # OLED (re-init safe)
@@ -96,17 +93,12 @@ device = None
 
 
 def oled_init() -> None:
-    """(Re)initialize the OLED device object."""
     global _serial, device
     _serial = i2c(port=I2C_PORT, address=I2C_ADDR)
     device = ssd1306(_serial, width=OLED_W, height=OLED_H)
 
 
 def oled_hard_wake() -> None:
-    """
-    Some child processes may leave the SSD1306 in DISPLAYOFF (or I2C in a weird state).
-    Re-init fixes it reliably.
-    """
     global device
     try:
         oled_init()
@@ -121,7 +113,6 @@ def oled_guard() -> None:
         oled_hard_wake()
 
 
-# Initialize once
 oled_init()
 
 
@@ -131,11 +122,8 @@ oled_init()
 def sd_write_check() -> Optional[str]:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Errno 21 guard: if a directory exists at the test-file path, remove it.
         if SD_TEST_FILE.exists() and SD_TEST_FILE.is_dir():
             return f"{SD_TEST_FILE} is a directory (Errno 21). Remove it."
-
         SD_TEST_FILE.write_text("ok\n")
         try:
             SD_TEST_FILE.unlink()
@@ -199,6 +187,13 @@ def oled_message(title: str, lines: List[str], footer: str = "") -> None:
             draw.text((0, 52), footer[:21], fill=255)
 
 
+def draw_progress(draw, pct: float) -> None:
+    x0, y0, x1, y1 = 8, 54, 120, 62
+    draw.rectangle((x0, y0, x1, y1), outline=255, fill=0)
+    w = int((x1 - x0 - 2) * max(0.0, min(1.0, pct)))
+    draw.rectangle((x0 + 1, y0 + 1, x0 + 1 + w, y1 - 1), outline=255, fill=255)
+
+
 def draw_waveform(draw, phase: float) -> None:
     mid = 40
     amp = 10
@@ -256,7 +251,6 @@ def init_buttons():
 
 
 def drain_events(consume, seconds: float = 0.25) -> None:
-    """Drain queued button events to prevent ghost presses."""
     end = time.time() + seconds
     while time.time() < end:
         consume("up")
@@ -319,16 +313,12 @@ def discover_modules(modules_root: Path) -> List[Module]:
 
 
 # =====================================================
-# RADIO CONNECTIONS (Bluetooth autoconnect)
+# RADIO CONNECTIONS (Bluetooth autoconnect) - UNCHANGED
 # =====================================================
 CONNECTIONS_FILE = DATA_DIR / "connections.json"
 
 
 def load_connections() -> dict:
-    """
-    Load /opt/blackbox/data/connections.json (or BLACKBOX_DATA override).
-    Returns {} if missing or invalid.
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if not CONNECTIONS_FILE.exists():
@@ -347,18 +337,11 @@ def bluetooth_is_connected(mac: str) -> bool:
 
 
 def bluetooth_connect(mac: str, timeout: float = 8.0) -> bool:
-    """
-    Attempt to connect to a known/trusted device.
-    Returns True if connected, False otherwise.
-    Never blocks longer than timeout.
-    """
-    # Safe: ensures BT isn't soft-blocked
     try:
         subprocess.run(["rfkill", "unblock", "bluetooth"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
     except Exception:
         pass
 
-    # If already connected, we're done
     if bluetooth_is_connected(mac):
         return True
 
@@ -377,12 +360,13 @@ def bluetooth_connect(mac: str, timeout: float = 8.0) -> bool:
     return False
 
 
+_status_bt_mac = ""
+_bt_ok = False
+_last_status_check = 0.0
+_wifi_bars = 0
+
+
 def bluetooth_autoconnect_ui() -> bool:
-    """
-    Reads connections.json and attempts BT connect if configured.
-    Shows a short status message on OLED.
-    Returns True if connected, else False (or no config).
-    """
     cfg = load_connections()
     bt = (cfg or {}).get("bluetooth", {}) if isinstance(cfg, dict) else {}
     mac = (bt.get("mac") or "").strip()
@@ -390,13 +374,11 @@ def bluetooth_autoconnect_ui() -> bool:
     global _status_bt_mac
     _status_bt_mac = mac
 
-
     if not mac or not autoconnect:
         return False
 
     oled_message(f"{PRODUCT_NAME} AUDIO", [mac, "Connecting...", ""], "BACK = skip")
 
-    # Try a short connect window
     ok = bluetooth_connect(mac, timeout=8.0)
 
     if ok:
@@ -408,39 +390,17 @@ def bluetooth_autoconnect_ui() -> bool:
     time.sleep(0.6)
     return False
 
-# =====================================================
-# STATUS INDICATORS (Wi-Fi bars + Bluetooth icon)
-# =====================================================
-
-_last_status_check = 0.0
-_wifi_bars = 0           # 0..3
-_bt_ok = False
-_status_bt_mac = ""
-
 
 def wifi_rssi_dbm(interface: str = "wlan0") -> Optional[int]:
-    """
-    Returns RSSI in dBm (e.g., -52) or None if not connected/unknown.
-    Uses: iw dev wlan0 link
-    """
     try:
-        r = subprocess.run(
-            ["iw", "dev", interface, "link"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
+        r = subprocess.run(["iw", "dev", interface, "link"], capture_output=True, text=True, timeout=2)
         out = (r.stdout or "").splitlines()
-        # If not connected, output often contains "Not connected."
         if any("Not connected" in ln for ln in out):
             return None
-
         for ln in out:
             ln = ln.strip().lower()
-            # Example: "signal: -52 dBm"
             if ln.startswith("signal:"):
                 parts = ln.replace("dbm", "").split()
-                # parts like ["signal:", "-52"]
                 for p in parts:
                     if p.lstrip("-").isdigit():
                         return int(p)
@@ -450,14 +410,6 @@ def wifi_rssi_dbm(interface: str = "wlan0") -> Optional[int]:
 
 
 def wifi_bars_from_rssi(rssi: Optional[int]) -> int:
-    """
-    Map RSSI (dBm) to 0..3 bars.
-    Typical guidance:
-      >= -55: excellent (3)
-      >= -67: good      (2)
-      >= -80: fair      (1)
-      else:   weak/off  (0)
-    """
     if rssi is None:
         return 0
     if rssi >= -55:
@@ -469,25 +421,38 @@ def wifi_bars_from_rssi(rssi: Optional[int]) -> int:
     return 0
 
 
+def status_refresh(force: bool = False) -> None:
+    global _last_status_check, _wifi_bars, _bt_ok
+
+    now = time.time()
+    if (not force) and (now - _last_status_check) < 2.0:
+        return
+    _last_status_check = now
+
+    rssi = wifi_rssi_dbm("wlan0")
+    if rssi is None:
+        _wifi_bars = 1 if get_ip() else 0
+    else:
+        _wifi_bars = wifi_bars_from_rssi(rssi)
+
+    if _status_bt_mac:
+        _bt_ok = bluetooth_is_connected(_status_bt_mac)
+    else:
+        _bt_ok = False
+
+
 def draw_wifi_bars(draw, x_right: int, y_top: int, bars: int) -> int:
-    """
-    Draw 0..3 Wi-Fi bars ending at x_right.
-    Returns the left-most x used (so caller can place other icons to the left).
-    """
-    # Bar geometry
     w = 2
     gap = 1
-    heights = [3, 6, 9]  # 3 bars
+    heights = [3, 6, 9]
     total_w = 3 * w + 2 * gap
     x0 = x_right - total_w
 
-    # Draw outline bars (unfilled)
     for i, h in enumerate(heights):
         x = x0 + i * (w + gap)
         y0 = y_top + (9 - h)
         draw.rectangle((x, y0, x + w - 1, y_top + 9), outline=255, fill=0)
 
-    # Fill bars up to 'bars'
     for i in range(min(3, max(0, bars))):
         h = heights[i]
         x = x0 + i * (w + gap)
@@ -498,18 +463,10 @@ def draw_wifi_bars(draw, x_right: int, y_top: int, bars: int) -> int:
 
 
 def draw_bt_icon(draw, x_right: int, y_top: int, connected: bool) -> int:
-    """
-    Draw a tiny Bluetooth indicator at the top-right area.
-    We'll do 'B' plus a dot that is filled when connected.
-    Returns the left-most x used.
-    """
-    # Small "B"
     text = "B"
-    # Put text so its right edge is at x_right
-    x_text = max(0, x_right - 6)  # ~6px per char
+    x_text = max(0, x_right - 6)
     draw.text((x_text, y_top), text, fill=255)
 
-    # Dot to the left of the B
     dot_x = x_text - 5
     dot_y = y_top + 3
     if connected:
@@ -520,40 +477,10 @@ def draw_bt_icon(draw, x_right: int, y_top: int, connected: bool) -> int:
     return dot_x
 
 
-def status_refresh(force: bool = False) -> None:
-    """
-    Refresh Wi-Fi + BT status at most every ~2 seconds (unless forced).
-    """
-    global _last_status_check, _wifi_bars, _bt_ok
-
-    now = time.time()
-    if (not force) and (now - _last_status_check) < 2.0:
-        return
-    _last_status_check = now
-
-    # Wi-Fi bars: use RSSI if possible; fall back to "has IP" => 1 bar
-    rssi = wifi_rssi_dbm("wlan0")
-    if rssi is None:
-        _wifi_bars = 1 if get_ip() else 0
-    else:
-        _wifi_bars = wifi_bars_from_rssi(rssi)
-
-    # BT connected?
-    if _status_bt_mac:
-        _bt_ok = bluetooth_is_connected(_status_bt_mac)
-    else:
-        _bt_ok = False
-
 # =====================================================
 # UI SCREENS
 # =====================================================
 def splash() -> None:
-    """
-    Instrument-style boot screen:
-      - shows product name + subtitle
-      - shows version + minimal status line
-      - waits SPLASH_MIN_SECONDS and for IP (current behavior)
-    """
     start = time.time()
     phase = 0.0
 
@@ -564,42 +491,27 @@ def splash() -> None:
 
         oled_guard()
         with canvas(device) as draw:
-            # Top: product name
             draw.text((0, 0), PRODUCT_NAME[:21], fill=255)
-
-            # Right: version
             draw.text((OLED_W - (len(VERSION) * 6), 0), VERSION, fill=255)
-
             draw.line((0, 12, 127, 12), fill=255)
-
-            # Middle: subtitle + tagline
             draw.text((0, 16), PRODUCT_SUBTITLE[:21], fill=255)
             draw.text((0, 28), TAGLINE[:21], fill=255)
-
-            # Bottom: status line
             draw.line((0, 44, 127, 44), fill=255)
             draw.text((0, 48), f"{net}  {bt}"[:21], fill=255)
-
-            # Tiny waveform “alive” indicator (subtle)
             draw_waveform(draw, phase)
 
         phase += 0.15
 
-        # Keep your existing behavior: minimum splash time + wait for IP
         if (time.time() - start) >= SPLASH_MIN_SECONDS and ip:
             return
 
         time.sleep(SPLASH_FRAME_SLEEP)
 
+
 def startup_sequence(consume, clear) -> None:
-    """
-    Instrument-style boot sequence with real checks.
-    Keeps it short and purposeful.
-    """
     clear()
     drain_events(consume, seconds=0.10)
 
-    # Step 1: BOOT
     t0 = time.time()
     while time.time() - t0 < 0.9:
         oled_guard()
@@ -611,7 +523,6 @@ def startup_sequence(consume, clear) -> None:
             draw_progress(draw, (time.time() - t0) / 0.9)
         time.sleep(0.05)
 
-    # Step 2: SELF TEST (do real checks)
     sd_err = sd_write_check()
     i2c_ok = True
     try:
@@ -630,8 +541,6 @@ def startup_sequence(consume, clear) -> None:
     )
     time.sleep(1.2)
 
-    # Step 3: RADIOS (wait briefly for Wi-Fi + attempt BT)
-    # Wi-Fi: give it a short window; we no longer need the old "splash wait for IP" behavior
     t1 = time.time()
     ip = ""
     while time.time() - t1 < 2.5:
@@ -647,10 +556,8 @@ def startup_sequence(consume, clear) -> None:
             break
         time.sleep(0.1)
 
-    # BT autoconnect with UI (already shows its own screen briefly)
     bt_ok = bluetooth_autoconnect_ui()
 
-    # Step 4: READY
     oled_message(
         "READY",
         [
@@ -671,11 +578,8 @@ def draw_menu(mods: List[Module], idx: int) -> None:
 
     oled_guard()
     with canvas(device) as draw:
-        # Header left
         draw.text((0, 0), f"{PRODUCT_NAME} MENU"[:21], fill=255)
 
-        # Header right: Bluetooth + Wi-Fi bars
-        # Start from far-right and draw BT, then Wi-Fi to its left
         x = OLED_W - 1
         x = draw_bt_icon(draw, x_right=x, y_top=0, connected=_bt_ok) - 3
         _ = draw_wifi_bars(draw, x_right=x, y_top=1, bars=_wifi_bars)
@@ -695,15 +599,6 @@ def draw_menu(mods: List[Module], idx: int) -> None:
             draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
 
         draw.text((0, 52), "SEL=run  HOLD=cfg", fill=255)
-
-
-def draw_progress(draw, pct: float) -> None:
-    # pct 0.0..1.0
-    x0, y0, x1, y1 = 8, 54, 120, 62
-    draw.rectangle((x0, y0, x1, y1), outline=255, fill=0)
-    w = int((x1 - x0 - 2) * max(0.0, min(1.0, pct)))
-    draw.rectangle((x0 + 1, y0 + 1, x0 + 1 + w, y1 - 1), outline=255, fill=255)
-
 
 
 # =====================================================
@@ -760,14 +655,108 @@ def settings(consume, clear) -> None:
             return
         time.sleep(0.15)
 
+
+# =====================================================
+# UAP Caller: hardened non-blocking stdout pump
+# =====================================================
+class StdoutJSONPump:
+    """
+    Non-blocking pump that:
+      - never calls readline()
+      - drains as much as is available per tick
+      - splits by newline into JSON lines
+      - tolerates partial lines
+    """
+    def __init__(self, fileobj, log_fn):
+        self.fileobj = fileobj
+        self.log = log_fn
+        self.buf = bytearray()
+        self.fd = fileobj.fileno()
+        os.set_blocking(self.fd, False)
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.fd, selectors.EVENT_READ)
+
+    def close(self):
+        try:
+            self.sel.unregister(self.fd)
+        except Exception:
+            pass
+        try:
+            self.fileobj.close()
+        except Exception:
+            pass
+        try:
+            self.sel.close()
+        except Exception:
+            pass
+
+    def pump(self, max_bytes: int = 65536, max_lines: int = 50) -> List[Dict[str, Any]]:
+        """
+        Drain available stdout and return parsed JSON messages (up to max_lines).
+        Never blocks.
+        """
+        msgs: List[Dict[str, Any]] = []
+        if not self.sel.select(timeout=0):
+            return msgs
+
+        drained = 0
+        while drained < max_bytes:
+            try:
+                chunk = os.read(self.fd, min(4096, max_bytes - drained))
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                break
+
+            if not chunk:
+                break
+
+            drained += len(chunk)
+            self.buf.extend(chunk)
+
+            # Process complete lines
+            while b"\n" in self.buf and len(msgs) < max_lines:
+                line, _, rest = self.buf.partition(b"\n")
+                self.buf = bytearray(rest)
+
+                if not line:
+                    continue
+                try:
+                    s = line.decode("utf-8", errors="strict").strip()
+                except Exception:
+                    continue
+                if not s:
+                    continue
+
+                # Child must never emit non-JSON; but be defensive.
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    self.log(f"[child-nonjson] {s}")
+                    continue
+
+                self.log(f"[child] {s}")
+                msgs.append(obj)
+
+            if len(msgs) >= max_lines:
+                break
+
+        return msgs
+
+
 # =====================================================
 # MODULE RUNNER
 # =====================================================
 def run_module(mod: Module, consume, clear) -> None:
     """
     Runs a module as a child process and forwards button events to it via stdin.
-    Expected stdin commands in module:
-      up, down, select, select_hold, back
+    For uap_caller ONLY:
+      - reads JSON messages from stdout non-blocking via StdoutJSONPump
+      - updates OLED based on child state
+      - never blocks main loop
+      - drains stdout fast enough to prevent pipe backpressure deadlocks
     """
     ensure_dirs()
 
@@ -778,8 +767,8 @@ def run_module(mod: Module, consume, clear) -> None:
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
     cmd = [sys.executable, mod.entry_path]
-
     log_path = log_path_for(mod.id)
+
     try:
         logf = open(log_path, "w", buffering=1)
     except Exception:
@@ -796,14 +785,16 @@ def run_module(mod: Module, consume, clear) -> None:
 
     is_uap = (mod.id == "uap_caller")
 
+    # Start child
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE if is_uap else (logf if logf else subprocess.DEVNULL),
             stderr=logf if logf else subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
+            text=False if is_uap else True,
+            bufsize=0 if is_uap else 1,
+            close_fds=True,
         )
     except Exception as e:
         if logf:
@@ -821,7 +812,7 @@ def run_module(mod: Module, consume, clear) -> None:
     def send(cmd_text: str) -> None:
         try:
             if proc.poll() is None and proc.stdin:
-                proc.stdin.write(cmd_text + "\n")
+                proc.stdin.write((cmd_text + "\n").encode("utf-8"))
                 proc.stdin.flush()
         except Exception:
             pass
@@ -830,82 +821,115 @@ def run_module(mod: Module, consume, clear) -> None:
     # UAP Caller JSON UI path
     # -----------------------------
     if is_uap:
-        # Ensure these imports exist at top of app.py:
-        # import json
-        # import selectors
-        out_sel = selectors.DefaultSelector()
-        if proc.stdout:
-            out_sel.register(proc.stdout, selectors.EVENT_READ)
+        pump = None
+        try:
+            if proc.stdout is None:
+                raise RuntimeError("uap_caller requires stdout=PIPE")
+            pump = StdoutJSONPump(proc.stdout, log)
+        except Exception as e:
+            log(f"[launcher] pump_init_failed: {e!r}")
+            oled_message("UAP Caller", ["Pump init failed", str(e)[:21], ""], "BACK")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            oled_hard_wake()
+            return
 
-        state = {
+        # UAP UI state
+        state: Dict[str, Any] = {
             "page": "build",
             "build_pct": 0.0,
-            "build_step": "",
+            "build_step": "Starting...",
+            "ready": False,
             "playing": False,
             "elapsed_s": 0,
+            "duration_s": 0,
+            "fatal": "",
         }
 
+        last_msg_time = time.time()
+        last_draw_time = 0.0
+
         def draw_build() -> None:
-            oled_message(
-                "UAP Call Sig",
-                [state["build_step"][:21], f"{int(state['build_pct']*100):3d}%"],
-                "Loading...",
-            )
+            pct = float(state.get("build_pct") or 0.0)
+            step = str(state.get("build_step") or "")[:21]
+            oled_message("UAP Call Sig", [step, f"{int(pct * 100):3d}%"], "Building...")
 
         def draw_playback() -> None:
-            mm, ss = divmod(int(state["elapsed_s"]), 60)
-            st = "PLAYING" if state["playing"] else "READY"
+            elapsed = int(state.get("elapsed_s") or 0)
+            mm, ss = divmod(elapsed, 60)
+            st = "PLAYING" if state.get("playing") else ("READY" if state.get("ready") else "NOT READY")
             oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play BACK")
 
-        def pump_stdout_once() -> None:
-            # Read at most ONE line per tick. Never loop/never block the UI.
-            events = out_sel.select(timeout=0)
-            if not events:
-                return
-            if not proc.stdout:
-                return
+        def draw_fatal() -> None:
+            msg = (str(state.get("fatal") or "Unknown error"))[:21]
+            oled_message("UAP Caller", ["ERROR", msg, ""], "BACK")
 
-            try:
-                line = proc.stdout.readline()
-            except Exception:
-                return
-            if not line:
-                return
-
-            log(f"[child] {line.rstrip()}")
-
-            try:
-                msg = json.loads(line)
-            except Exception:
-                # Ignore non-JSON lines; DO NOT freeze.
-                return
-
-            t = msg.get("type")
-            if t == "page":
-                state["page"] = msg.get("name", state["page"])
-            elif t == "build":
-                state["build_pct"] = float(msg.get("pct", state["build_pct"]))
-                state["build_step"] = str(msg.get("step", state["build_step"]))
-                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
-            elif t == "state":
-                state["playing"] = bool(msg.get("playing", state["playing"]))
-                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
-            elif t == "fatal":
-                state["page"] = "fatal"
-                state["build_step"] = str(msg.get("message", "fatal"))[:21]
-            elif t == "exit":
-                pass
-
+        # Main module loop
         while proc.poll() is None:
-            pump_stdout_once()
+            # 1) Drain stdout fast enough to prevent pipe fill
+            msgs = pump.pump(max_bytes=65536, max_lines=80)
+            if msgs:
+                last_msg_time = time.time()
 
-            if state.get("page") == "build":
-                draw_build()
-            elif state.get("page") == "fatal":
-                oled_message("UAP Caller", ["ERROR", state.get("build_step", "")], "BACK")
-            else:
-                draw_playback()
+            for msg in msgs:
+                t = msg.get("type")
+                if t == "page":
+                    state["page"] = msg.get("name", state["page"])
+                elif t == "build":
+                    # pct can be 0..1
+                    try:
+                        state["build_pct"] = float(msg.get("pct", state["build_pct"]))
+                    except Exception:
+                        pass
+                    state["build_step"] = str(msg.get("step", state["build_step"]))
+                    # optional
+                    if "elapsed_s" in msg:
+                        try:
+                            state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+                        except Exception:
+                            pass
+                elif t == "state":
+                    state["ready"] = bool(msg.get("ready", state["ready"]))
+                    state["playing"] = bool(msg.get("playing", state["playing"]))
+                    try:
+                        state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+                    except Exception:
+                        pass
+                    try:
+                        state["duration_s"] = int(msg.get("duration_s", state["duration_s"]))
+                    except Exception:
+                        pass
+                elif t == "fatal":
+                    state["page"] = "fatal"
+                    state["fatal"] = str(msg.get("message", "fatal"))
+                elif t == "exit":
+                    # child requests exit; break after it actually exits or shortly
+                    pass
+                # ignore hello/error etc (optional)
 
+            # 2) UI watchdog: if build page and no messages for too long, show “alive”
+            now = time.time()
+            silent_s = now - last_msg_time
+            if state.get("page") == "build" and silent_s > 2.5:
+                # do not change pct; just show the last step with a spinner-ish cue
+                step = str(state.get("build_step") or "Working")
+                if not step.endswith("."):
+                    state["build_step"] = (step[:18] + "...")
+
+            # 3) Draw at a sane rate (avoid wasting CPU)
+            if (now - last_draw_time) >= 0.08:
+                if state.get("page") == "fatal":
+                    draw_fatal()
+                elif state.get("page") == "build":
+                    draw_build()
+                else:
+                    draw_playback()
+                last_draw_time = now
+
+            # 4) Forward buttons
             if consume("up"):
                 send("up")
             if consume("down"):
@@ -929,20 +953,27 @@ def run_module(mod: Module, consume, clear) -> None:
                         pass
                 break
 
-            time.sleep(0.02)
-
-        try:
-            if proc.stdout:
+            # 5) Hard watchdog: if child goes totally silent too long, fail safe
+            # (prevents infinite hung child from trapping UI)
+            if silent_s > 30.0:
+                log("[launcher] watchdog: child silent >30s; terminating")
                 try:
-                    out_sel.unregister(proc.stdout)
+                    proc.terminate()
                 except Exception:
                     pass
-                proc.stdout.close()
+                break
+
+            time.sleep(0.02)
+
+        # Cleanup pump/stdout
+        try:
+            if pump:
+                pump.close()
         except Exception:
             pass
 
     # -----------------------------
-    # Normal modules path
+    # Normal modules path (legacy stdin forwarding)
     # -----------------------------
     else:
         while proc.poll() is None:
@@ -1001,11 +1032,11 @@ def run_module(mod: Module, consume, clear) -> None:
     # Child may have left OLED off; recover here
     oled_hard_wake()
 
+
 # =====================================================
 # MAIN
 # =====================================================
 def main() -> None:
-    # ---- Early SD guard (hard stop) ----
     err = sd_write_check()
     if err is not None:
         oled_message("SD ERROR", [err[:21], "", ""], "")
@@ -1025,7 +1056,7 @@ def main() -> None:
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
-    last_menu_draw = 0.0  # force immediate draw
+    last_menu_draw = 0.0
     back_pressed_at = None
 
     def redraw_menu() -> None:
@@ -1038,11 +1069,9 @@ def main() -> None:
     while True:
         now = time.time()
 
-        # ---- Watchdog refresh (blank menu recovery) ----
         if now - last_menu_draw >= MENU_REFRESH_SECONDS:
             redraw_menu()
 
-        # ---- Navigation ----
         if consume("up"):
             idx = (idx - 1) % len(modules)
             redraw_menu()
@@ -1051,31 +1080,25 @@ def main() -> None:
             idx = (idx + 1) % len(modules)
             redraw_menu()
 
-        # ---- Select: run module ----
         if consume("select"):
-            # Prevent SELECT press from forwarding into the module at launch timing
             clear()
             drain_events(consume, seconds=0.10)
 
             if modules[idx].id != "none":
                 run_module(modules[idx], consume, clear)
 
-            # Always redraw menu immediately after returning from a module
             redraw_menu()
 
-        # ---- Hold Select: settings ----
         if consume("select_hold"):
             settings(consume, clear)
             redraw_menu()
 
-        # ---- BACK hold: reboot/poweroff (uses raw button state) ----
         if btn_back.is_pressed:
             if back_pressed_at is None:
                 back_pressed_at = now
 
             held = now - back_pressed_at
 
-            # Prioritize the longer hold first (poweroff > reboot)
             if held >= BACK_POWEROFF_HOLD:
                 if confirm_action("POWEROFF?", consume, clear):
                     poweroff()
@@ -1089,13 +1112,10 @@ def main() -> None:
                     return
                 back_pressed_at = None
                 redraw_menu()
-
         else:
             back_pressed_at = None
 
-        # ---- CRITICAL FIX ----
-        # Always eat any queued BACK events while in the menu loop.
-        # Otherwise a stale BACK can leak into a module launch/return path.
+        # Eat queued BACK events while in menu loop.
         consume("back")
 
         time.sleep(0.02)
