@@ -49,7 +49,7 @@ AMP_BREATH = 0.15
 BREATH_SEED = 1337
 CHUNK_SECONDS = float(os.environ.get("UAP_CHUNK_S", "0.75"))
 
-SIGNATURE_VERSION = "uap3_signature_v7_nonblocking_stdin"
+SIGNATURE_VERSION = "uap3_signature_v8_hardexit"
 
 running = True
 stop_now = threading.Event()
@@ -73,6 +73,18 @@ def emit(obj: dict) -> None:
         sys.stdout.flush()
     except Exception:
         pass
+
+
+def _hard_exit(code: int = 0) -> None:
+    """
+    Last-resort exit that cannot hang.
+    Must remain JSON-only before exit.
+    """
+    try:
+        emit({"type": "exit"})
+    finally:
+        # Immediate process termination; avoids hangs in native code / stuck threads.
+        os._exit(code)
 
 
 # -----------------------------
@@ -272,7 +284,7 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
             ping_mask = cycle5 < ping_dur
             ping_env = np.zeros_like(t, dtype=np.float64)
             if np.any(ping_mask):
-                ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
+                ping_env[ping_mask] = (np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2)
             layer3 = (np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING).astype(np.float64, copy=False)
 
             chirp_dur = 0.2
@@ -285,7 +297,7 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
                 tr = cycle10[chirp_mask]
                 k = (f1 - f0) / chirp_dur
                 phase = 2 * np.pi * (f0 * tr + 0.5 * k * tr * tr)
-                env = np.sin(np.pi * (tr / chirp_dur)) ** 2
+                env = (np.sin(np.pi * (tr / chirp_dur)) ** 2)
                 chirp[chirp_mask] = np.sin(phase) * env
             layer4 = (chirp * AMP_CHIRP).astype(np.float64, copy=False)
 
@@ -296,7 +308,7 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
             mod = 0.8 + 0.2 * np.sin(2 * np.pi * 0.1 * t)
             layer5 = (pad * mod * AMP_AMBIENT).astype(np.float64, copy=False)
 
-            noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32, copy=False)
+            noise = rng.normal(0.0, 1.0, size=cur_size).astype("float32", copy=False)
             filtered = moving_average_same(noise, klen)
             cycleB = np.mod(t, 5.0)
             envB = np.zeros_like(t, dtype=np.float64)
@@ -311,7 +323,7 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
             if max_amp > 0.95:
                 mixed = mixed * (0.95 / max_amp)
 
-            pcm = (mixed * 32767.0).astype(np.int16, copy=False)
+            pcm = (mixed * 32767.0).astype("int16", copy=False)
             wf.writeframes(pcm.tobytes())
 
             done = chunk_start + cur_size
@@ -366,12 +378,11 @@ def start_build_async(force_rebuild: bool) -> None:
             try:
                 build_uap_signature(_build_cancel)
             except Exception as e:
-                # If we were cancelled as part of shutdown, don't scream fatal
                 if not (stop_now.is_set() or _build_cancel.is_set()):
                     emit({"type": "fatal", "message": f"Build failed: {e}"})
             finally:
                 _set_building(False)
-                if signature_is_ready() and not (_build_cancel.is_set() or stop_now.is_set()):
+                if signature_is_ready() and not (stop_now.is_set() or _build_cancel.is_set()):
                     emit({"type": "page", "name": "playback"})
                     send_state()
 
@@ -379,9 +390,6 @@ def start_build_async(force_rebuild: bool) -> None:
         _build_thread.start()
 
 
-# -----------------------------
-# Command handling
-# -----------------------------
 def handle_cmd(cmd: str) -> None:
     cmd = (cmd or "").strip().lower()
     if not cmd:
@@ -391,7 +399,6 @@ def handle_cmd(cmd: str) -> None:
         if _building:
             send_state()
             return
-
         if is_playing():
             stop_playback()
         else:
@@ -399,7 +406,6 @@ def handle_cmd(cmd: str) -> None:
                 emit({"type": "fatal", "message": "Signature not ready"})
                 return
             start_playback_loop(OUT_WAV)
-
         send_state()
         return
 
@@ -410,40 +416,22 @@ def handle_cmd(cmd: str) -> None:
     if cmd == "back":
         _build_cancel.set()
         stop_playback()
-        emit({"type": "exit"})
-        stop_now.set()
-        return
+        # Make exit deterministic
+        _hard_exit(0)
 
-    # up/down ignored
     return
 
 
-# -----------------------------
-# Signals (must stop promptly)
-# -----------------------------
 def _sig_handler(signum, frame):
-    global running
-    running = False
+    # Make termination deterministic under timeout/systemd
     stop_now.set()
     _build_cancel.set()
     stop_playback()
-    # Do NOT block here. Loop will exit quickly.
-    # Also emit exit so parent can clean up.
-    emit({"type": "exit"})
+    _hard_exit(0)
 
 
 signal.signal(signal.SIGINT, _sig_handler)
 signal.signal(signal.SIGTERM, _sig_handler)
-
-
-# -----------------------------
-# Non-blocking stdin loop
-# -----------------------------
-def _setup_nonblocking_stdin(sel: selectors.BaseSelector):
-    fd = sys.stdin.fileno()
-    os.set_blocking(fd, False)
-    sel.register(fd, selectors.EVENT_READ)
-    return fd
 
 
 def main() -> int:
@@ -453,8 +441,7 @@ def main() -> int:
         _pick_player()
     except Exception as e:
         emit({"type": "fatal", "message": str(e)})
-        emit({"type": "exit"})
-        return 2
+        _hard_exit(2)
 
     if not signature_is_ready():
         start_build_async(force_rebuild=False)
@@ -463,13 +450,14 @@ def main() -> int:
         send_state()
 
     sel = selectors.DefaultSelector()
-    fd = _setup_nonblocking_stdin(sel)
-    buf = bytearray()
+    fd = sys.stdin.fileno()
+    os.set_blocking(fd, False)
+    sel.register(fd, selectors.EVENT_READ)
 
+    buf = bytearray()
     last_state_emit = 0.0
 
-    while running and not stop_now.is_set():
-        # Periodic state updates so launcher UI stays fresh during playback
+    while not stop_now.is_set():
         now = time.time()
         if (now - last_state_emit) >= 0.25:
             send_state()
@@ -482,6 +470,7 @@ def main() -> int:
         for key, _mask in events:
             if key.fd != fd:
                 continue
+
             try:
                 chunk = os.read(fd, 4096)
             except BlockingIOError:
@@ -489,32 +478,19 @@ def main() -> int:
             except OSError as e:
                 if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     continue
-                stop_now.set()
-                break
+                _hard_exit(0)
 
             if not chunk:
-                # stdin closed -> exit
-                stop_now.set()
-                break
+                _hard_exit(0)
 
             buf.extend(chunk)
             while b"\n" in buf:
                 line, _, rest = buf.partition(b"\n")
                 buf = bytearray(rest)
-                try:
-                    handle_cmd(line.decode("utf-8", errors="ignore"))
-                except Exception as e:
-                    emit({"type": "fatal", "message": f"Runtime error: {e}"})
-                    stop_now.set()
-                    break
+                handle_cmd(line.decode("utf-8", errors="ignore"))
 
-    # shutdown
-    stop_now.set()
-    _build_cancel.set()
-    stop_playback()
-    emit({"type": "exit"})
-    return 0
+    _hard_exit(0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
