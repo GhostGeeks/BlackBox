@@ -752,11 +752,12 @@ class StdoutJSONPump:
 def run_module(mod: Module, consume, clear) -> None:
     """
     Runs a module as a child process and forwards button events to it via stdin.
-    For uap_caller ONLY:
-      - reads JSON messages from stdout non-blocking via StdoutJSONPump
-      - updates OLED based on child state
-      - never blocks main loop
-      - drains stdout fast enough to prevent pipe backpressure deadlocks
+
+    Special JSON stdout UI paths:
+      - uap_caller
+      - noise_generator
+
+    All other modules remain legacy (stdin forwarding only; stdout->log/devnull).
     """
     ensure_dirs()
 
@@ -784,16 +785,18 @@ def run_module(mod: Module, consume, clear) -> None:
     log(f"[launcher] cmd={cmd!r}")
 
     is_uap = (mod.id == "uap_caller")
+    is_noise = (mod.id == "noise_generator")
+    is_json_ui = is_uap or is_noise
 
     # Start child
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE if is_uap else (logf if logf else subprocess.DEVNULL),
+            stdout=subprocess.PIPE if is_json_ui else (logf if logf else subprocess.DEVNULL),
             stderr=logf if logf else subprocess.DEVNULL,
-            text=False if is_uap else True,
-            bufsize=0 if is_uap else 1,
+            text=False if is_json_ui else True,
+            bufsize=0 if is_json_ui else 1,
             close_fds=True,
         )
     except Exception as e:
@@ -957,6 +960,184 @@ def run_module(mod: Module, consume, clear) -> None:
             # (prevents infinite hung child from trapping UI)
             if silent_s > 30.0:
                 log("[launcher] watchdog: child silent >30s; terminating")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            time.sleep(0.02)
+
+        # Cleanup pump/stdout
+        try:
+            if pump:
+                pump.close()
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Noise Generator JSON UI path
+    # -----------------------------
+    elif is_noise:
+        pump = None
+        try:
+            if proc.stdout is None:
+                raise RuntimeError("noise_generator requires stdout=PIPE")
+            pump = StdoutJSONPump(proc.stdout, log)
+        except Exception as e:
+            log(f"[launcher] pump_init_failed: {e!r}")
+            oled_message("Noise Gen", ["Pump init failed", str(e)[:21], ""], "BACK")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            oled_hard_wake()
+            return
+
+        # Noise UI state (fed by child JSON)
+        state: Dict[str, Any] = {
+            "page": "main",
+            "ready": False,
+            "mode": "white",
+            "playing": False,
+            "volume": 70,
+            "loop": True,
+            "fatal": "",
+            "toast": "",
+            "toast_until": 0.0,
+        }
+
+        last_msg_time = time.time()
+        last_draw_time = 0.0
+
+        def _norm_mode(m: str) -> str:
+            m = (m or "").strip().lower()
+            if not m:
+                return "White"
+            # Title-case common types
+            return m[:1].upper() + m[1:]
+
+        def draw_noise_main() -> None:
+            mode = _norm_mode(str(state.get("mode") or "white"))
+            playing = bool(state.get("playing"))
+            vol = int(state.get("volume") or 0)
+            vol = max(0, min(100, vol))
+            loop = bool(state.get("loop", True))
+
+            status = "PLAY" if playing else "STOP"
+            loop_s = "LOOP" if loop else "ONCE"
+
+            # Toast overrides line2 briefly
+            now = time.time()
+            toast = ""
+            if state.get("toast") and now < float(state.get("toast_until") or 0.0):
+                toast = str(state.get("toast") or "")[:21]
+
+            line1 = f"MODE {mode}"[:21]
+            line2 = toast if toast else f"{status}  VOL {vol:3d}"[:21]
+            line3 = f"{loop_s}"[:21]
+
+            oled_message("Noise Generator", [line1, line2, line3], "SEL=Play HOLD=Adj BACK")
+
+        def draw_noise_fatal() -> None:
+            msg = (str(state.get("fatal") or "Unknown error"))[:21]
+            oled_message("Noise Gen", ["ERROR", msg, ""], "BACK")
+
+        # Main module loop
+        while proc.poll() is None:
+            # 1) Drain stdout fast enough to prevent pipe fill
+            msgs = pump.pump(max_bytes=65536, max_lines=120)
+            if msgs:
+                last_msg_time = time.time()
+
+            exit_requested = False
+
+            for msg in msgs:
+                t = msg.get("type")
+
+                if t == "page":
+                    state["page"] = msg.get("name", state.get("page", "main"))
+
+                elif t == "state":
+                    if "ready" in msg:
+                        state["ready"] = bool(msg.get("ready"))
+                    if "mode" in msg:
+                        state["mode"] = str(msg.get("mode") or state.get("mode") or "white")
+                    if "playing" in msg:
+                        state["playing"] = bool(msg.get("playing"))
+                    if "volume" in msg:
+                        try:
+                            state["volume"] = int(msg.get("volume"))
+                        except Exception:
+                            pass
+                    if "loop" in msg:
+                        state["loop"] = bool(msg.get("loop"))
+
+                elif t == "toast":
+                    txt = str(msg.get("message") or "")[:21]
+                    if txt:
+                        state["toast"] = txt
+                        state["toast_until"] = time.time() + 1.2
+
+                elif t == "fatal":
+                    state["page"] = "fatal"
+                    state["fatal"] = str(msg.get("message", "fatal"))
+
+                elif t == "exit":
+                    exit_requested = True
+
+                # hello/other types ignored safely
+
+            now = time.time()
+            silent_s = now - last_msg_time
+
+            # 2) Draw at a sane rate (avoid wasting CPU)
+            if (now - last_draw_time) >= 0.08:
+                if state.get("page") == "fatal":
+                    draw_noise_fatal()
+                else:
+                    draw_noise_main()
+                last_draw_time = now
+
+            # If child asked to exit, break once it actually exits (or we bail shortly)
+            if exit_requested:
+                # give a brief chance to end naturally
+                for _ in range(25):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is not None:
+                    break
+
+            # 3) Forward buttons
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+            if consume("select"):
+                send("select")
+            if consume("select_hold"):
+                send("select_hold")
+
+            if consume("back"):
+                # back must exit immediately; module should stop playback and exit.
+                send("back")
+                for _ in range(50):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            # 4) Hard watchdog: if child goes totally silent too long, fail safe
+            # Noise module is required to heartbeat; if it doesn't, assume hung.
+            if silent_s > 15.0:
+                log("[launcher] watchdog: noise_generator silent >15s; terminating")
                 try:
                     proc.terminate()
                 except Exception:
