@@ -113,7 +113,7 @@ def _gen_brown(n: int, rng: random.Random) -> List[float]:
 def _write_wav(path: str, mode: str, volume_pct: int, seconds: float) -> None:
     n = int(SAMPLE_RATE * seconds)
     # deterministic seed, but changes across mode/volume for variety
-    rng = random.Random(0xB10C0 + volume_pct + (MODES.index(mode) * 1337)))
+    rng = random.Random(0xB10C0 + volume_pct + (MODES.index(mode) * 1337))
 
     if mode == "white":
         mono = _gen_white(n, rng)
