@@ -78,7 +78,7 @@ def _hard_exit(code: int = 0) -> None:
 # Playback
 # -----------------------------
 def _pick_player():
-    # Prefer PipeWire/Pulse (Bluetooth routing)
+    # Prefer PipeWire/Pulse path for Bluetooth
     if shutil.which("paplay"):
         return ["paplay"]
     if shutil.which("aplay"):
@@ -112,11 +112,38 @@ def stop_playback() -> None:
 
 
 def start_playback_loop(path: Path) -> None:
+    """
+    Never raise out of here. If playback fails, emit fatal and keep module alive.
+    """
     global play_proc, started_at
+
+    if not path.exists():
+        emit({"type": "fatal", "message": f"WAV missing: {path.name}"})
+        return
+
     stop_playback()
-    player = _pick_player()
-    play_proc = subprocess.Popen(player + [str(path)], stdout=DEVNULL, stderr=DEVNULL)
-    started_at = time.time()
+
+    try:
+        player = _pick_player()
+
+        # paplay plays once; aplay can loop with --loop=0
+        if os.path.basename(player[0]) == "aplay":
+            args = player + ["--loop=0", str(path)]
+        else:
+            args = player + [str(path)]
+
+        play_proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        started_at = time.time()
+
+    except Exception as e:
+        play_proc = None
+        started_at = None
+        emit({"type": "fatal", "message": f"Playback failed: {e.__class__.__name__}: {e}"})
+        return
 
 
 # -----------------------------
