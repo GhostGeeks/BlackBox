@@ -1192,7 +1192,6 @@ def run_module(mod: Module, consume, clear) -> None:
             return [
                 ("tone_type", f"Tone Type: {tone.title()}"),
                 ("freq",      f"Frequency: {freq}Hz"),
-                ("pulse_ms",  f"Sweep Rate: {pulse}ms"),
                 ("volume",    f"Volume: {vol}%"),
                 ("play",      f"Play: {'STOP' if playing else 'PLAY'}"),
             ]
