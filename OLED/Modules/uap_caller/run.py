@@ -115,18 +115,7 @@ def start_playback_loop(path: Path) -> None:
     global play_proc, started_at
     stop_playback()
     player = _pick_player()
-    if "aplay" in player[0]:
-        play_proc = subprocess.Popen(
-            player + ["--loop=0", str(path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        play_proc = subprocess.Popen(
-            player + [str(path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    play_proc = subprocess.Popen(player + [str(path)], stdout=DEVNULL, stderr=DEVNULL)
     started_at = time.time()
 
 
