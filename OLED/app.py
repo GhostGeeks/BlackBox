@@ -999,13 +999,11 @@ def run_module(mod: Module, consume, clear) -> None:
         state: Dict[str, Any] = {
             "page": "main",
             "ready": False,
-            "mode": "white",
-            "playing": False,
-            "volume": 70,
-            "loop": True,
+            "noise_type": "white",
             "pulse_ms": 200,
-            "focus": "mode",
-            "backend": "",
+            "volume": 70,
+            "playing": False,
+            "cursor": "noise",  # noise | rate | volume | play
             "fatal": "",
             "toast": "",
             "toast_until": 0.0,
@@ -1022,51 +1020,55 @@ def run_module(mod: Module, consume, clear) -> None:
             return m[:1].upper() + m[1:]
 
         def draw_noise_main() -> None:
-            mode_raw = str(state.get("mode") or "white").strip().lower()
-            # display label
-            if mode_raw == "white":
-                mode_disp = "White"
-            elif mode_raw == "pink":
-                mode_disp = "Pink"
-            elif mode_raw == "brown":
-                mode_disp = "Brown"
-            elif mode_raw == "sweep":
-                mode_disp = "Sweep"
+            noise_raw = str(state.get("noise_type") or "white").strip().lower()
+            if noise_raw == "white":
+                noise_disp = "White"
+            elif noise_raw == "pink":
+                noise_disp = "Pink"
+            elif noise_raw == "brown":
+                noise_disp = "Brown"
             else:
-                mode_disp = (mode_raw[:1].upper() + mode_raw[1:]) if mode_raw else "White"
+                noise_disp = (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
 
-            focus = str(state.get("focus") or "mode").strip().lower()
             pulse_ms = int(state.get("pulse_ms") or 200)
             vol = int(state.get("volume") or 0)
             vol = max(0, min(100, vol))
-
             playing = bool(state.get("playing"))
-            status = "PLAY" if playing else "STOP"
+            cursor = str(state.get("cursor") or "noise")
 
-            # Toast overlay (short-lived); we’ll show it as line 3 temporarily
+            # Toast overlay (short-lived) replaces bottom line
             now = time.time()
             toast = ""
             if state.get("toast") and now < float(state.get("toast_until") or 0.0):
                 toast = str(state.get("toast") or "")[:21]
 
-            # Bracket the focused value to mimic “submenu selection”
-            def fmt_value(label: str, value: str, is_focus: bool) -> str:
-                v = f"<{value}>"
-                if is_focus:
-                    v = f"[{v}]"
-                # keep within 21 chars for SSD1306 font
-                return f"{label}{v}"[:21]
+            items = [
+                ("noise",  f"Noise Type: {noise_disp}"),
+                ("rate",   f"Sweep Rate: {pulse_ms}ms"),
+                ("volume", f"Volume:     {vol}%"),
+                ("play",   f"Play:       {'STOP' if playing else 'PLAY'}"),
+            ]
 
-            line1 = fmt_value("Noise Type: ", mode_disp, focus == "mode")
-            line2 = fmt_value("Sweep Rate:", f"{pulse_ms}ms", focus == "pulse")
-            line3 = fmt_value("Volume:    ", f"{vol}%", focus == "volume")
+            # Show 3 at a time on 128x64 (title + 3 lines). Window depends on cursor.
+            idx = 0
+            for i, (k, _) in enumerate(items):
+                if k == cursor:
+                    idx = i
+                    break
+            start = 0 if idx < 3 else 1  # window: [0..2] or [1..3]
+            view = items[start:start+3]
 
-            # If toast is active, override line3 (least important)
+            lines = []
+            for k, text in view:
+                prefix = ">" if k == cursor else " "
+                lines.append((prefix + text)[:21])
+
+            footer = "UP/DN=Move SEL=Set"
+            oled_message("Noise Generator", lines, footer)
             if toast:
-                line3 = toast[:21]
-
-            # Footer hint stays simple
-            oled_message("Noise Generator", [line1, line2, line3], f"SEL={status} HOLD=Next BACK")
+                # Replace bottom line with toast (still keep cursor visible on top lines)
+                lines[-1] = toast[:21]
+                oled_message("Noise Generator", lines, footer)
 
         def draw_noise_fatal() -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]
@@ -1090,28 +1092,22 @@ def run_module(mod: Module, consume, clear) -> None:
                 elif t == "state":
                     if "ready" in msg:
                         state["ready"] = bool(msg.get("ready"))
-                    if "mode" in msg:
-                        state["mode"] = str(msg.get("mode") or state.get("mode") or "white")
-                    if "playing" in msg:
-                        state["playing"] = bool(msg.get("playing"))
-                    if "volume" in msg:
-                        try:
-                            state["volume"] = int(msg.get("volume"))
-                        except Exception:
-                            pass
-                    if "loop" in msg:
-                        state["loop"] = bool(msg.get("loop"))
-
-                    # NEW: pulse / focus / backend support
+                    if "noise_type" in msg:
+                        state["noise_type"] = str(msg.get("noise_type") or state.get("noise_type") or "white")
                     if "pulse_ms" in msg:
                         try:
                             state["pulse_ms"] = int(msg.get("pulse_ms"))
                         except Exception:
                             pass
-                    if "focus" in msg:
-                        state["focus"] = str(msg.get("focus") or state.get("focus") or "mode")
-                    if "backend" in msg:
-                        state["backend"] = str(msg.get("backend") or state.get("backend") or "")
+                    if "volume" in msg:
+                        try:
+                            state["volume"] = int(msg.get("volume"))
+                        except Exception:
+                            pass
+                    if "playing" in msg:
+                        state["playing"] = bool(msg.get("playing"))
+                    if "cursor" in msg:
+                        state["cursor"] = str(msg.get("cursor") or state.get("cursor") or "noise")
 
                 elif t == "toast":
                     txt = str(msg.get("message") or "")[:21]
