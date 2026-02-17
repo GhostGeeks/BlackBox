@@ -389,50 +389,42 @@ class NoiseModule:
 
     # ---- Page handlers ----
 
-    def open_noise_menu_cycle(self) -> None:
-        # live-apply cycling with select; no up/down
-        self.menu_noise_idx = self.noise_idx
-        self.set_page("noise_menu_cycle")
-
-    def open_noise_menu_scroll(self) -> None:
-        # up/down scroll; select confirm; back cancel
-        self.menu_noise_idx = self.noise_idx
-        self.set_page("noise_menu_scroll")
-
     def handle_main(self, cmd: str) -> None:
-        if cmd == "up":
-            self._move_cursor(-1)
-            return
-        if cmd == "down":
-            self._move_cursor(+1)
-            return
+    if cmd == "up":
+        self._move_cursor(-1)
+        return
+    if cmd == "down":
+        self._move_cursor(+1)
+        return
 
-        if cmd == "select":
-            if self.cursor == "noise":
-                self.open_noise_menu_cycle()
-                return
-            if self.cursor == "rate":
-                self._cycle_rate(+1)
-                return
-            # play
-            if self.playing:
-                self._stop_audio()
-            else:
-                self._start_audio()
-            self.emit_state(force=True)
+    if cmd == "select":
+        if self.cursor == "noise":
+            # QUICK NEXT (no menu)
+            self._apply_noise_idx(self.noise_idx + 1)
             return
-
-        if cmd == "select_hold":
-            if self.cursor == "noise":
-                self.open_noise_menu_scroll()
-                return
-            if self.cursor == "rate":
-                self._cycle_rate(-1)
-                return
-            # play row hold = stop
+        if self.cursor == "rate":
+            self._cycle_rate(+1)
+            return
+        # play
+        if self.playing:
             self._stop_audio()
-            self.emit_state(force=True)
+        else:
+            self._start_audio()
+        self.emit_state(force=True)
+        return
+
+    if cmd == "select_hold":
+        if self.cursor == "noise":
+            # HOLD opens scroll menu
+            self.open_noise_menu_scroll()
             return
+        if self.cursor == "rate":
+            self._cycle_rate(-1)
+            return
+        # play row hold = stop
+        self._stop_audio()
+        self.emit_state(force=True)
+        return
 
     def handle_noise_menu_cycle(self, cmd: str) -> None:
         # select cycles & applies immediately; back returns to main; hold = open scroll menu
@@ -447,30 +439,6 @@ class NoiseModule:
             self.set_page("main")
             return
         # ignore up/down in cycle menu to prevent accidental navigation
-
-    def handle_noise_menu_scroll(self, cmd: str) -> None:
-        if cmd == "up":
-            self.menu_noise_idx = (self.menu_noise_idx - 1) % len(NOISE_TYPES)
-            self.emit_state(force=True)
-            return
-        if cmd == "down":
-            self.menu_noise_idx = (self.menu_noise_idx + 1) % len(NOISE_TYPES)
-            self.emit_state(force=True)
-            return
-        if cmd == "select":
-            self._apply_noise_idx(self.menu_noise_idx)
-            self.set_page("main")
-            return
-        if cmd == "back":
-            # cancel
-            self.menu_noise_idx = self.noise_idx
-            self.set_page("main")
-            return
-        if cmd == "select_hold":
-            # quick cancel back to main
-            self.menu_noise_idx = self.noise_idx
-            self.set_page("main")
-            return
 
     def handle(self, cmd: str) -> None:
         if cmd == "back" and self.page == "main":
