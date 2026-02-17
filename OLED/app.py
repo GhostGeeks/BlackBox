@@ -822,700 +822,329 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
-        # -----------------------------
-        # UAP Caller JSON UI path
-        # -----------------------------
-        # UI state (fed by child JSON)
-        state: Dict[str, Any] = {
-            "page": "build",          # build|playback|fatal
-            "build_pct": 0.0,
-            "build_step": "",
-            "playing": False,
-            "elapsed_s": 0,
-            "fatal": "",
-        }
-
-        last_msg_time = time.time()
-        last_draw_time = 0.0
-
-        def draw_build() -> None:
-            pct = float(state.get("build_pct") or 0.0)
-            step = str(state.get("build_step") or "")[:21]
-            oled_message("UAP Call Sig", [step, f"{int(pct*100):3d}%"], "Loading…")
-
-        def draw_playback() -> None:
-            mm, ss = divmod(int(state.get("elapsed_s") or 0), 60)
-            playing = bool(state.get("playing"))
-            st = "PLAYING" if playing else "READY"
-            oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
-
-        def apply_msg(msg: Dict[str, Any]) -> None:
-            t = msg.get("type")
-            if t == "page":
-                name = str(msg.get("name") or state["page"])
-                state["page"] = name
-            elif t == "build":
-                state["page"] = "build"
-                state["build_pct"] = float(msg.get("pct", state["build_pct"]) or 0.0)
-                state["build_step"] = str(msg.get("step", state["build_step"]) or "")
-                # optional, if your child sends it:
-                if "elapsed_s" in msg:
-                    state["elapsed_s"] = int(msg.get("elapsed_s") or 0)
-            elif t == "state":
-                state["page"] = "playback"
-                state["playing"] = bool(msg.get("playing", state["playing"]))
-                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]) or 0)
-            elif t == "fatal":
-                state["page"] = "fatal"
-                state["fatal"] = str(msg.get("message") or "fatal")[:21]
-            elif t == "exit":
-                # child intends to exit; loop will break when proc.poll() changes
-                pass
-
-        # Main loop while module is alive
-        while proc.poll() is None:
-            # 1) Pump child stdout (non-blocking)
-            msgs = pump.pump(max_bytes=65536, max_lines=50)
-            if msgs:
-                last_msg_time = time.time()
-                for m in msgs:
-                    apply_msg(m)
-
-            # 2) Draw (throttle a bit)
-            now = time.time()
-            if now - last_draw_time >= 0.10:
-                if state.get("page") == "build":
-                    draw_build()
-                elif state.get("page") == "fatal":
-                    oled_message("UAP Caller", ["ERROR", state.get("fatal","")], "BACK")
-                else:
-                    draw_playback()
-                last_draw_time = now
-
-            # 3) Forward buttons (HOLD FIRST)
-            if consume("up"):
-                send("up")
-            if consume("down"):
-                send("down")
-
-            if consume("select_hold"):
-                send("select_hold")
-                consume("select")  # discard any queued short-press from same physical press
-            elif consume("select"):
-                send("select")
-
-            if consume("back"):
-                send("back")
-                for _ in range(50):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                break
-
-            # 4) Watchdog: if child goes silent too long, fail safe
-            if (time.time() - last_msg_time) > 20.0:
-                log("[launcher] watchdog: uap_caller silent >20s; terminating")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                break
-
-            time.sleep(0.02)
-
-# -----------------------------
-        # UAP Caller JSON UI path
-        # -----------------------------
-        # UI state (fed by child JSON)
-        state: Dict[str, Any] = {
-            "page": "build",          # build|playback|fatal
-            "build_pct": 0.0,
-            "build_step": "",
-            "playing": False,
-            "elapsed_s": 0,
-            "fatal": "",
-        }
-
-        last_msg_time = time.time()
-        last_draw_time = 0.0
-
-        def draw_build() -> None:
-            pct = float(state.get("build_pct") or 0.0)
-            step = str(state.get("build_step") or "")[:21]
-            oled_message("UAP Call Sig", [step, f"{int(pct*100):3d}%"], "Loading…")
-
-        def draw_playback() -> None:
-            mm, ss = divmod(int(state.get("elapsed_s") or 0), 60)
-            playing = bool(state.get("playing"))
-            st = "PLAYING" if playing else "READY"
-            oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
-
-        def apply_msg(msg: Dict[str, Any]) -> None:
-            t = msg.get("type")
-            if t == "page":
-                name = str(msg.get("name") or state["page"])
-                state["page"] = name
-            elif t == "build":
-                state["page"] = "build"
-                state["build_pct"] = float(msg.get("pct", state["build_pct"]) or 0.0)
-                state["build_step"] = str(msg.get("step", state["build_step"]) or "")
-                # optional, if your child sends it:
-                if "elapsed_s" in msg:
-                    state["elapsed_s"] = int(msg.get("elapsed_s") or 0)
-            elif t == "state":
-                state["page"] = "playback"
-                state["playing"] = bool(msg.get("playing", state["playing"]))
-                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]) or 0)
-            elif t == "fatal":
-                state["page"] = "fatal"
-                state["fatal"] = str(msg.get("message") or "fatal")[:21]
-            elif t == "exit":
-                # child intends to exit; loop will break when proc.poll() changes
-                pass
-
-        # Main loop while module is alive
-        while proc.poll() is None:
-            # 1) Pump child stdout (non-blocking)
-            msgs = pump.pump(max_bytes=65536, max_lines=50)
-            if msgs:
-                last_msg_time = time.time()
-                for m in msgs:
-                    apply_msg(m)
-
-            # 2) Draw (throttle a bit)
-            now = time.time()
-            if now - last_draw_time >= 0.10:
-                if state.get("page") == "build":
-                    draw_build()
-                elif state.get("page") == "fatal":
-                    oled_message("UAP Caller", ["ERROR", state.get("fatal","")], "BACK")
-                else:
-                    draw_playback()
-                last_draw_time = now
-
-            # 3) Forward buttons (HOLD FIRST)
-            if consume("up"):
-                send("up")
-            if consume("down"):
-                send("down")
-
-            if consume("select_hold"):
-                send("select_hold")
-                consume("select")  # discard any queued short-press from same physical press
-            elif consume("select"):
-                send("select")
-
-            if consume("back"):
-                send("back")
-                for _ in range(50):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                break
-
-            # 4) Watchdog: if child goes silent too long, fail safe
-            if (time.time() - last_msg_time) > 20.0:
-                log("[launcher] watchdog: uap_caller silent >20s; terminating")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                break
-
-            time.sleep(0.02)
-
-        # -----------------------------
-    # Noise Generator JSON UI path
-    # -----------------------------
-    elif is_noise:
+    # =====================================================
+    # JSON UI MODULES (UAP / Noise / Tone)
+    # =====================================================
+    if is_json_ui:
         pump = None
         try:
             if proc.stdout is None:
-                raise RuntimeError("noise_generator requires stdout=PIPE")
+                raise RuntimeError("json-ui module requires stdout=PIPE")
             pump = StdoutJSONPump(proc.stdout, log)
         except Exception as e:
             log(f"[launcher] pump_init_failed: {e!r}")
-            oled_message("Noise Gen", ["Pump init failed", str(e)[:21], ""], "BACK")
+            oled_message(mod.name[:21], ["Pump init failed", str(e)[:21], ""], "BACK")
             try:
                 proc.terminate()
             except Exception:
                 pass
             time.sleep(1.0)
             oled_hard_wake()
-            return
-
-        # Noise UI state (fed by child JSON)
-        state: Dict[str, Any] = {
-            "page": "main",
-            "ready": False,
-            "noise_type": "white",
-            "pulse_ms": 200,
-            "playing": False,
-            "cursor": "noise",        # main: noise|rate|play
-            "menu_noise_idx": 0,      # scroll menu highlight
-            "fatal": "",
-        }
-
-        last_msg_time = time.time()
-        last_draw_time = 0.0
-
-        def _noise_disp() -> str:
-            raw = str(state.get("noise_type") or "white").strip().lower()
-            return {"white": "White", "pink": "Pink", "brown": "Brown"}.get(
-                raw, (raw[:1].upper() + raw[1:]) if raw else "White"
-            )
-
-        def draw_main() -> None:
-            noise_disp = _noise_disp()
-            pulse_ms = int(state.get("pulse_ms") or 200)
-            playing = bool(state.get("playing"))
-            cursor = str(state.get("cursor") or "noise")
-
-            items = [
-                ("noise", f"Noise Type: {noise_disp}"),
-                ("rate",  f"Sweep Rate: {pulse_ms}ms"),
-                ("play",  f"Play:       {'STOP' if playing else 'PLAY'}"),
-            ]
-
-            lines = []
-            for k, text in items:
-                prefix = ">" if k == cursor else " "
-                lines.append((prefix + text)[:21])
-
-            oled_message("Noise Generator", lines, "SEL=Open HOLD=Menu BACK")
-
-        def draw_noise_menu_cycle() -> None:
-            # This menu is “cycle/apply on SEL”, “scroll menu on HOLD”
-            noise_disp = _noise_disp()
-            lines = [
-                ("> " + noise_disp)[:21],
-                "  SEL=Next/Apply"[:21],
-                "  HOLD=Scroll"[:21],
-            ]
-            oled_message("Noise Types", lines, "BACK=Done")
-
-        def draw_noise_menu_scroll() -> None:
-            # scroll list: up/down highlight, select choose, back cancel
-            types = ["White", "Pink", "Brown"]
-            idx = int(state.get("menu_noise_idx") or 0) % len(types)
-            lines = []
-            for i, name in enumerate(types):
-                prefix = ">" if i == idx else " "
-                lines.append((prefix + name)[:21])
-            oled_message("Noise Types", lines, "SEL=Choose BACK=Cancel")
-
-        def draw_fatal() -> None:
-            msg = (str(state.get("fatal") or "Unknown error"))[:21]
-            oled_message("Noise Gen", ["ERROR", msg, ""], "BACK")
-
-        # Main noise loop
-        while proc.poll() is None:
-            # 1) Drain stdout fast enough to prevent pipe fill
-            msgs = pump.pump(max_bytes=65536, max_lines=160)
-            if msgs:
-                last_msg_time = time.time()
-
-            exit_requested = False
-
-            # 2) Apply JSON messages
-            for msg in msgs:
-                t = msg.get("type")
-
-                if t == "page":
-                    state["page"] = str(msg.get("name") or state.get("page") or "main")
-
-                elif t == "state":
-                    if "ready" in msg:
-                        state["ready"] = bool(msg.get("ready"))
-                    if "page" in msg:
-                        state["page"] = str(msg.get("page") or state.get("page") or "main")
-                    if "noise_type" in msg:
-                        state["noise_type"] = str(msg.get("noise_type") or state.get("noise_type") or "white")
-                    if "pulse_ms" in msg:
-                        try:
-                            state["pulse_ms"] = int(msg.get("pulse_ms"))
-                        except Exception:
-                            pass
-                    if "playing" in msg:
-                        state["playing"] = bool(msg.get("playing"))
-                    if "cursor" in msg:
-                        state["cursor"] = str(msg.get("cursor") or state.get("cursor") or "noise")
-                    if "menu_noise_idx" in msg:
-                        try:
-                            state["menu_noise_idx"] = int(msg.get("menu_noise_idx"))
-                        except Exception:
-                            pass
-
-                elif t == "fatal":
-                    state["page"] = "fatal"
-                    state["fatal"] = str(msg.get("message", "fatal"))
-
-                elif t == "exit":
-                    exit_requested = True
-
-            now = time.time()
-            silent_s = now - last_msg_time
-
-            # 3) Draw at a sane rate
-            if (now - last_draw_time) >= 0.08:
-                pg = str(state.get("page") or "main")
-                if pg == "fatal":
-                    draw_fatal()
-                elif pg == "noise_menu_cycle":
-                    draw_noise_menu_cycle()
-                elif pg == "noise_menu_scroll":
-                    draw_noise_menu_scroll()
-                else:
-                    draw_main()
-                last_draw_time = now
-
-            # 4) Exit if child requested it
-            if exit_requested:
-                for _ in range(25):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                break
-
-            # 5) Forward buttons (HOLD FIRST)
-            if consume("up"):
-                send("up")
-            if consume("down"):
-                send("down")
-
-            # Important: hold-first prevents select firing before hold
-            if consume("select_hold"):
-                send("select_hold")
-                # discard any short-press queued from the same physical press
-                consume("select")
-            elif consume("select"):
-                send("select")
-
-            if consume("back"):
-                send("back")
-                for _ in range(50):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                break
-
-            # 6) Watchdog: if child goes silent too long, fail safe
-            if silent_s > 15.0:
-                log("[launcher] watchdog: noise_generator silent >15s; terminating")
+            if logf:
                 try:
-                    proc.terminate()
+                    logf.close()
                 except Exception:
                     pass
-                break
-
-            time.sleep(0.02)
-
-        # Cleanup pump/stdout
-        try:
-            if pump:
-                pump.close()
-        except Exception:
-            pass
-
-    # -----------------------------
-    # Tone Generator JSON UI path (NEW)
-    # -----------------------------
-    elif is_tone:
-        pump = None
-        try:
-            if proc.stdout is None:
-                raise RuntimeError("tone_generator requires stdout=PIPE")
-            pump = StdoutJSONPump(proc.stdout, log)
-        except Exception as e:
-            log(f"[launcher] pump_init_failed: {e!r}")
-            oled_message("Tone Gen", ["Pump init failed", str(e)[:21], ""], "BACK")
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            time.sleep(1.0)
-            oled_hard_wake()
             return
 
-        # Minimal UI state driven by child JSON
-        state: Dict[str, Any] = {
-            "page": "main",
-            "ready": False,
-            "playing": False,
-            "freq_hz": 440,
-            "volume": 70,
-            "selection_label": "440Hz",
-            "cursor_main": "frequency",
-            "cursor_freq_menu": "manual",
-            "idx_special_freq": 0,
-            "idx_special_tone": 0,
-            "toast": "",
-            "toast_until": 0.0,
-            "fatal": "",
-        }
+        # -----------------------------
+        # UAP Caller JSON UI path
+        # -----------------------------
+        if is_uap:
+            state: Dict[str, Any] = {
+                "page": "build",          # build|playback|fatal
+                "build_pct": 0.0,
+                "build_step": "",
+                "playing": False,
+                "elapsed_s": 0,
+                "fatal": "",
+            }
 
-        SPECIAL_FREQS_UI = [
-            (174, "Foundation Freq"),
-            (285, "Healing Freq"),
-            (396, "Liberating Freq"),
-            (417, "Resonating Freq"),
-            (528, "Love Freq"),
-            (639, "Connecting Freq"),
-            (741, "Awakening Freq"),
-            (852, "Intuition Freq"),
-            (936, "The Universe"),
-        ]
-        SPECIAL_TONES_UI = [
-            ("sweep_asc", "Frequency Sweep Asc"),
-            ("sweep_des", "Frequency Sweep Des"),
-            ("sweep_bell", "Frequency Sweep Bell"),
-            ("shepard_asc", "Shepard Tone Asc"),
-            ("shepard_des", "Shepard Tone Des"),
-            ("contact_call", "Contact Call (Original)"),
-            ("contact_resp", "Contact Response (Original)"),
-        ]
+            last_msg_time = time.time()
+            last_draw_time = 0.0
 
-        MAIN_ROWS_UI = ["frequency", "volume", "play"]
-        FREQ_MENU_ROWS_UI = ["manual", "special_freq", "special_tone"]
+            def draw_build() -> None:
+                pct = float(state.get("build_pct") or 0.0)
+                step = str(state.get("build_step") or "")[:21]
+                oled_message("UAP Call Sig", [step, f"{int(pct*100):3d}%"], "Loading…")
 
-        last_msg_time = time.time()
-        last_draw_time = 0.0
+            def draw_playback() -> None:
+                mm, ss = divmod(int(state.get("elapsed_s") or 0), 60)
+                playing = bool(state.get("playing"))
+                st = "PLAYING" if playing else "READY"
+                oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
 
-        def _text_w_px(s: str) -> int:
-            return len(s) * 6
-
-        def _draw_header(draw, title: str, status: str = ""):
-            draw.text((2, 0), title[:21], fill=255)
-            if status:
-                s = status[:6]
-                x = max(0, OLED_W - _text_w_px(s) - 2)
-                draw.text((x, 0), s, fill=255)
-            draw.line((0, 12, 127, 12), fill=255)
-
-        def _draw_footer(draw, text: str):
-            draw.line((0, 52, 127, 52), fill=255)
-            draw.text((2, 54), text[:21], fill=255)
-
-        def _draw_row(draw, y: int, text: str, selected: bool):
-            marker = ">" if selected else " "
-            draw.text((0, y), marker, fill=255)
-            draw.text((10, y), text[:19], fill=255)
-
-        def _toast_active() -> str:
-            now = time.time()
-            if state.get("toast") and now < float(state.get("toast_until") or 0.0):
-                return str(state.get("toast") or "")[:21]
-            return ""
-
-        def _draw_toast(draw, toast_text: str):
-            if not toast_text:
-                return
-            draw.rectangle((0, 38, 127, 51), outline=255, fill=0)
-            draw.text((2, 40), toast_text, fill=255)
-
-        def _status() -> str:
-            ready = bool(state.get("ready"))
-            playing = bool(state.get("playing"))
-            return "PLAY" if playing else ("RDY" if ready else "ERR")
-
-        def draw_main():
-            label = str(state.get("selection_label") or f"{int(state.get('freq_hz') or 440)}Hz")
-            vol = int(state.get("volume") or 70)
-            playing = bool(state.get("playing"))
-            cursor = str(state.get("cursor_main") or "frequency")
-
-            rows = [
-                ("frequency", f"Frequency: {label}"[:19]),
-                ("volume",    f"Volume: {vol}%"[:19]),
-                ("play",      f"Play: {'STOP' if playing else 'PLAY'}"[:19]),
-            ]
-            toast_text = _toast_active()
-
-            oled_guard()
-            with canvas(device) as draw:
-                _draw_header(draw, "Tone Generator", status=_status())
-                y0 = 14
-                row_h = 12
-                for i, (k, txt) in enumerate(rows):
-                    _draw_row(draw, y0 + i * row_h, txt, selected=(k == cursor))
-                _draw_footer(draw, "SEL=enter/chg BACK")
-                _draw_toast(draw, toast_text)
-
-        def draw_freq_menu():
-            cursor = str(state.get("cursor_freq_menu") or "manual")
-            rows = [
-                ("manual",       "Manual Frequency"),
-                ("special_freq", "Special Frequency"),
-                ("special_tone", "Special Tones"),
-            ]
-            toast_text = _toast_active()
-
-            oled_guard()
-            with canvas(device) as draw:
-                _draw_header(draw, "Frequency", status=_status())
-                y0 = 14
-                row_h = 12
-                for i, (k, txt) in enumerate(rows):
-                    _draw_row(draw, y0 + i * row_h, txt, selected=(k == cursor))
-                _draw_footer(draw, "SEL=enter  BACK")
-                _draw_toast(draw, toast_text)
-
-        def draw_freq_edit():
-            freq = int(state.get("freq_hz") or 440)
-            toast_text = _toast_active()
-
-            oled_guard()
-            with canvas(device) as draw:
-                _draw_header(draw, "Manual Freq", status=_status())
-                draw.text((2, 18), f"{freq} Hz"[:21], fill=255)
-                draw.text((2, 32), "UP/DN change"[:21], fill=255)
-                draw.text((2, 44), "SEL done  BACK"[:21], fill=255)
-                _draw_toast(draw, toast_text)
-
-        def draw_list_page(title: str, items: List[str], idx: int):
-            n = len(items)
-            idx = 0 if n == 0 else max(0, min(n - 1, idx))
-            start = max(0, min(idx - 1, n - 3))
-            window = items[start:start + 3]
-            toast_text = _toast_active()
-
-            oled_guard()
-            with canvas(device) as draw:
-                _draw_header(draw, title, status=_status())
-                y0 = 14
-                row_h = 12
-                for i, label in enumerate(window):
-                    selected = (start + i) == idx
-                    _draw_row(draw, y0 + i * row_h, label, selected)
-                _draw_footer(draw, "SEL pick  BACK")
-                _draw_toast(draw, toast_text)
-
-        def draw_special_freqs():
-            idx = int(state.get("idx_special_freq") or 0)
-            items = [f"{hz}Hz {name}"[:19] for (hz, name) in SPECIAL_FREQS_UI]
-            draw_list_page("Special Freqs", items, idx)
-
-        def draw_special_tones():
-            idx = int(state.get("idx_special_tone") or 0)
-            items = [lbl[:19] for (_tid, lbl) in SPECIAL_TONES_UI]
-            draw_list_page("Special Tones", items, idx)
-
-        def draw_fatal():
-            msg = (str(state.get("fatal") or "Unknown error"))[:21]
-            oled_message("Tone Gen", ["ERROR", msg, ""], "BACK")
-
-        # Main tone loop
-        while proc.poll() is None:
-            msgs = pump.pump(max_bytes=65536, max_lines=160)
-            if msgs:
-                last_msg_time = time.time()
-
-            exit_requested = False
-
-            for msg in msgs:
+            def apply_msg(msg: Dict[str, Any]) -> bool:
                 t = msg.get("type")
-
                 if t == "page":
-                    state["page"] = msg.get("name", state.get("page", "main"))
-
+                    state["page"] = str(msg.get("name") or state["page"])
+                elif t == "build":
+                    state["page"] = "build"
+                    state["build_pct"] = float(msg.get("pct", state["build_pct"]) or 0.0)
+                    state["build_step"] = str(msg.get("step", state["build_step"]) or "")
+                    if "elapsed_s" in msg:
+                        state["elapsed_s"] = int(msg.get("elapsed_s") or 0)
                 elif t == "state":
-                    for k in (
-                        "page", "ready", "playing", "freq_hz", "volume",
-                        "selection_label", "cursor_main", "cursor_freq_menu",
-                        "idx_special_freq", "idx_special_tone"
-                    ):
-                        if k in msg:
-                            state[k] = msg.get(k)
-
-                elif t == "toast":
-                    txt = str(msg.get("message") or "")[:21]
-                    if txt:
-                        state["toast"] = txt
-                        state["toast_until"] = time.time() + 1.2
-
+                    state["page"] = "playback"
+                    state["playing"] = bool(msg.get("playing", state["playing"]))
+                    state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]) or 0)
                 elif t == "fatal":
                     state["page"] = "fatal"
-                    state["fatal"] = str(msg.get("message", "fatal"))
-                    state["toast"] = state["fatal"][:21]
-                    state["toast_until"] = time.time() + 2.0
-
+                    state["fatal"] = str(msg.get("message") or "fatal")[:21]
                 elif t == "exit":
-                    exit_requested = True
+                    return True
+                return False
 
-            now = time.time()
-            silent_s = now - last_msg_time
+            while proc.poll() is None:
+                msgs = pump.pump(max_bytes=65536, max_lines=160)
+                if msgs:
+                    last_msg_time = time.time()
 
-            if (now - last_draw_time) >= 0.08:
-                pg = str(state.get("page") or "main")
-                if pg == "fatal":
-                    draw_fatal()
-                elif pg == "freq_menu":
-                    draw_freq_menu()
-                elif pg == "freq_edit":
-                    draw_freq_edit()
-                elif pg == "special_freqs":
-                    draw_special_freqs()
-                elif pg == "special_tones":
-                    draw_special_tones()
-                else:
-                    draw_main()
-                last_draw_time = now
+                exit_requested = False
+                for m in msgs:
+                    if apply_msg(m):
+                        exit_requested = True
 
-            if exit_requested:
-                for _ in range(25):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is not None:
+                now = time.time()
+                if now - last_draw_time >= 0.10:
+                    if state.get("page") == "build":
+                        draw_build()
+                    elif state.get("page") == "fatal":
+                        oled_message("UAP Caller", ["ERROR", state.get("fatal", "")], "BACK")
+                    else:
+                        draw_playback()
+                    last_draw_time = now
+
+                if exit_requested:
                     break
 
-            # Forward buttons
-            if consume("up"):
-                send("up")
-            if consume("down"):
-                send("down")
-            if consume("select"):
-                send("select")
-            if consume("select_hold"):
-                send("select_hold")
+                # Forward buttons (HOLD FIRST)
+                if consume("up"):
+                    send("up")
+                if consume("down"):
+                    send("down")
+                if consume("select_hold"):
+                    send("select_hold")
+                    consume("select")
+                elif consume("select"):
+                    send("select")
+                if consume("back"):
+                    send("back")
+                    break
 
-            if consume("back"):
-                send("back")
-                for _ in range(50):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is None:
+                if (time.time() - last_msg_time) > 20.0:
+                    log("[launcher] watchdog: uap_caller silent >20s; terminating")
                     try:
                         proc.terminate()
                     except Exception:
                         pass
-                break
+                    break
 
-            if silent_s > 15.0:
-                log("[launcher] watchdog: tone_generator silent >15s; terminating")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                break
+                time.sleep(0.02)
 
-            time.sleep(0.02)
+        # -----------------------------
+        # Noise Generator JSON UI path
+        # -----------------------------
+        elif is_noise:
+            state: Dict[str, Any] = {
+                "page": "main",            # main|noise_menu_scroll|fatal
+                "ready": False,
+                "noise_type": "white",
+                "pulse_ms": 200,
+                "playing": False,
+                "cursor": "noise",         # noise|rate|play
+                "menu_noise_idx": 0,       # menu highlight
+                "fatal": "",
+            }
+
+            last_msg_time = time.time()
+            last_draw_time = 0.0
+
+            def _noise_disp() -> str:
+                raw = str(state.get("noise_type") or "white").strip().lower()
+                return {"white": "White", "pink": "Pink", "brown": "Brown"}.get(
+                    raw, (raw[:1].upper() + raw[1:]) if raw else "White"
+                )
+
+            def draw_main() -> None:
+                noise_disp = _noise_disp()
+                pulse_ms = int(state.get("pulse_ms") or 200)
+                playing = bool(state.get("playing"))
+                cursor = str(state.get("cursor") or "noise")
+
+                items = [
+                    ("noise", f"Noise Type: {noise_disp}"),
+                    ("rate",  f"Sweep Rate: {pulse_ms}ms"),
+                    ("play",  f"Play:       {'STOP' if playing else 'PLAY'}"),
+                ]
+
+                lines = []
+                for k, text in items:
+                    prefix = ">" if k == cursor else " "
+                    lines.append((prefix + text)[:21])
+
+                oled_message("Noise Generator", lines, "SEL=Next HOLD=Menu")
+
+            def draw_noise_menu_scroll() -> None:
+                types = ["White", "Pink", "Brown"]
+                idx = int(state.get("menu_noise_idx") or 0) % len(types)
+                lines = []
+                for i, name in enumerate(types):
+                    prefix = ">" if i == idx else " "
+                    lines.append((prefix + name)[:21])
+                oled_message("Noise Types", lines, "SEL=Choose BACK=Cancel")
+
+            def draw_fatal() -> None:
+                msg = (str(state.get("fatal") or "Unknown error"))[:21]
+                oled_message("Noise Gen", ["ERROR", msg, ""], "BACK")
+
+            while proc.poll() is None:
+                msgs = pump.pump(max_bytes=65536, max_lines=160)
+                if msgs:
+                    last_msg_time = time.time()
+
+                exit_requested = False
+                for msg in msgs:
+                    t = msg.get("type")
+
+                    if t == "page":
+                        state["page"] = str(msg.get("name") or state.get("page") or "main")
+
+                    elif t == "state":
+                        if "ready" in msg:
+                            state["ready"] = bool(msg.get("ready"))
+                        if "page" in msg:
+                            state["page"] = str(msg.get("page") or state.get("page") or "main")
+                        if "noise_type" in msg:
+                            state["noise_type"] = str(msg.get("noise_type") or state.get("noise_type") or "white")
+                        if "pulse_ms" in msg:
+                            try:
+                                state["pulse_ms"] = int(msg.get("pulse_ms"))
+                            except Exception:
+                                pass
+                        if "playing" in msg:
+                            state["playing"] = bool(msg.get("playing"))
+                        if "cursor" in msg:
+                            state["cursor"] = str(msg.get("cursor") or state.get("cursor") or "noise")
+                        if "menu_noise_idx" in msg:
+                            try:
+                                state["menu_noise_idx"] = int(msg.get("menu_noise_idx"))
+                            except Exception:
+                                pass
+
+                    elif t == "fatal":
+                        state["page"] = "fatal"
+                        state["fatal"] = str(msg.get("message", "fatal"))
+
+                    elif t == "exit":
+                        exit_requested = True
+
+                now = time.time()
+                if (now - last_draw_time) >= 0.08:
+                    pg = str(state.get("page") or "main")
+                    if pg == "fatal":
+                        draw_fatal()
+                    elif pg == "noise_menu_scroll":
+                        draw_noise_menu_scroll()
+                    else:
+                        draw_main()
+                    last_draw_time = now
+
+                if exit_requested:
+                    break
+
+                # Forward buttons (HOLD FIRST)
+                if consume("up"):
+                    send("up")
+                if consume("down"):
+                    send("down")
+                if consume("select_hold"):
+                    send("select_hold")
+                    consume("select")
+                elif consume("select"):
+                    send("select")
+                if consume("back"):
+                    send("back")
+                    break
+
+                if (time.time() - last_msg_time) > 15.0:
+                    log("[launcher] watchdog: noise_generator silent >15s; terminating")
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+
+                time.sleep(0.02)
+
+        # -----------------------------
+        # Tone Generator JSON UI path (NEW)
+        # -----------------------------
+        else:  # is_tone
+            # Keep your existing tone UI state machine here if you like.
+            # Minimum: pump JSON, render pages, forward buttons hold-first, watchdog.
+            # NOTE: Your current tone path forwards select before select_hold; keep hold-first.
+            state: Dict[str, Any] = {
+                "page": "main",
+                "fatal": "",
+            }
+            last_msg_time = time.time()
+            last_draw_time = 0.0
+
+            def draw_fatal() -> None:
+                msg = (str(state.get("fatal") or "Unknown error"))[:21]
+                oled_message("Tone Gen", ["ERROR", msg, ""], "BACK")
+
+            while proc.poll() is None:
+                msgs = pump.pump(max_bytes=65536, max_lines=160)
+                if msgs:
+                    last_msg_time = time.time()
+
+                exit_requested = False
+                for msg in msgs:
+                    t = msg.get("type")
+                    if t == "page":
+                        state["page"] = str(msg.get("name") or "main")
+                    elif t == "fatal":
+                        state["page"] = "fatal"
+                        state["fatal"] = str(msg.get("message", "fatal"))
+                    elif t == "exit":
+                        exit_requested = True
+
+                now = time.time()
+                if (now - last_draw_time) >= 0.10:
+                    if state.get("page") == "fatal":
+                        draw_fatal()
+                    else:
+                        oled_message("Tone Generator", ["(UI omitted)", "", ""], "BACK")
+                    last_draw_time = now
+
+                if exit_requested:
+                    break
+
+                # Forward buttons (HOLD FIRST)
+                if consume("up"):
+                    send("up")
+                if consume("down"):
+                    send("down")
+                if consume("select_hold"):
+                    send("select_hold")
+                    consume("select")
+                elif consume("select"):
+                    send("select")
+                if consume("back"):
+                    send("back")
+                    break
+
+                if (time.time() - last_msg_time) > 15.0:
+                    log("[launcher] watchdog: tone_generator silent >15s; terminating")
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+
+                time.sleep(0.02)
 
         # Cleanup pump/stdout
         try:
@@ -1524,33 +1153,23 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
-    # -----------------------------
+    # =====================================================
     # Normal modules path (legacy stdin forwarding)
-    # -----------------------------
+    # =====================================================
     else:
         while proc.poll() is None:
             if consume("up"):
                 send("up")
             if consume("down"):
                 send("down")
-            if consume("select"):
-                send("select")
             if consume("select_hold"):
                 send("select_hold")
-
+                consume("select")
+            elif consume("select"):
+                send("select")
             if consume("back"):
                 send("back")
-                for _ in range(40):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
                 break
-
             time.sleep(0.02)
 
     # cleanup stdin
