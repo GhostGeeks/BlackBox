@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
 """
-BlackBox - Noise Generator (headless module) - pulsed spirit-box style
+BlackBox - Noise Generator (headless module) - pulsed spirit-box style (no volume)
 
-UX MODEL:
-- up/down: move cursor among rows: Noise Type, Sweep Rate, Volume, Play
-- select: activate row:
-    Noise Type -> next
-    Sweep Rate -> next
-    Volume -> increase
-    Play -> toggle play/stop (play uses stored values)
-- select_hold: reverse/quick:
-    Noise Type -> previous
-    Sweep Rate -> previous
-    Volume -> decrease
-    Play -> stop
-- back: stop + exit
-
-TECH RULES:
-- JSON-only stdout (never print anything else)
-- Non-blocking stdin (selectors + os.read)
-- Heartbeat state <= 250ms
-- Audio via one background sh loop (paplay preferred, then pw-play, then aplay)
-- Never block main loop; never touch OLED; no BT management
-- All player/shell stderr captured to /tmp/blackbox_noise_audio.err (never stdout)
+Changes in this revision:
+- Volume removed completely (speaker handles volume)
+- Clean 3-row main UI: Noise Type / Sweep Rate / Play
+- Noise selection is now a real menu page:
+    * select on Noise Type opens noise_menu_cycle (select cycles + applies live)
+    * select_hold on Noise Type opens noise_menu_scroll (up/down scroll, select confirms)
+- No toast overlays required for normal operation
+- JSON-only stdout; non-blocking stdin; heartbeat <=250ms
+- Audio uses pattern.wav loop (single background /bin/sh loop)
+- shell+player stderr -> /tmp/blackbox_noise_audio.err
 """
 
 import errno
@@ -40,21 +29,18 @@ from typing import Optional, Dict, Any, List
 
 
 MODULE_NAME = "noise_generator"
-MODULE_VERSION = "ng_v4_fullreplace_pattern"
+MODULE_VERSION = "ng_v5_menus_novol"
 
 HEARTBEAT_S = 0.25
 TICK_S = 0.05
 
-# Pattern (WAV) length; longer hides loop seams; shorter regenerates faster.
 PATTERN_SECONDS = 8.0
-
-# Duty of each pulse: 0.85 = noise "on" for 85% of the pulse period.
-# Higher feels faster/denser (closer to continuous sweep).
-PULSE_DUTY = 0.90
+PULSE_DUTY = 0.90  # higher = denser sweep
 
 SAMPLE_RATE = 44100
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # int16
+AMP = 0.85  # fixed; speaker handles volume
 
 AUDIO_ERR_LOG = "/tmp/blackbox_noise_audio.err"
 TMP_PREFIX = "blackbox_noise_"
@@ -63,8 +49,8 @@ PULSE_OPTIONS_MS = [150, 200, 250, 300]
 NOISE_TYPES: List[str] = ["white", "pink", "brown"]
 NOISE_LABEL = {"white": "White", "pink": "Pink", "brown": "Brown"}
 
-# Cursor rows in order
-ROWS = ["noise", "rate", "volume", "play"]  # Noise Type, Sweep Rate, Volume, Play
+# Main rows
+ROWS = ["noise", "rate", "play"]  # Noise Type, Sweep Rate, Play
 
 
 def _emit(obj: Dict[str, Any]) -> None:
@@ -83,10 +69,6 @@ def _which(cmd: str) -> Optional[str]:
         if os.path.isfile(fp) and os.access(fp, os.X_OK):
             return fp
     return None
-
-
-def _clamp(v: int, lo: int, hi: int) -> int:
-    return lo if v < lo else hi if v > hi else v
 
 
 def _int16(x: float) -> int:
@@ -154,8 +136,7 @@ def _apply_fade(mono: List[float], fade_ms: int) -> List[float]:
     return out
 
 
-def _write_wav(path: str, mono: List[float], volume_pct: int) -> None:
-    amp = (volume_pct / 100.0) * 0.85
+def _write_wav(path: str, mono: List[float]) -> None:
     with wave.open(path, "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(SAMPLE_WIDTH)
@@ -163,7 +144,7 @@ def _write_wav(path: str, mono: List[float], volume_pct: int) -> None:
 
         frames = bytearray()
         for s in mono:
-            v = _int16(s * amp)
+            v = _int16(s * AMP)
             b = int(v).to_bytes(2, "little", signed=True)
             frames += b
             frames += b
@@ -173,7 +154,7 @@ def _write_wav(path: str, mono: List[float], volume_pct: int) -> None:
 class AudioLoop:
     """
     Plays a single WAV file in a forever loop using one /bin/sh process.
-    Captures *shell + player* stderr to AUDIO_ERR_LOG.
+    Captures shell+player stderr to AUDIO_ERR_LOG.
     """
 
     def __init__(self) -> None:
@@ -236,7 +217,6 @@ class AudioLoop:
         return f"rc={rc} {tail}".strip() if tail else f"rc={rc}"
 
     def _player_cmd(self, wav_path: str) -> str:
-        # Quote paths; keep it simple.
         if self.player == "pw-play":
             return f'"{self.player_path}" "{wav_path}"'
         if self.player == "paplay":
@@ -259,7 +239,7 @@ class AudioLoop:
 
         play_cmd = self._player_cmd(wav_path)
 
-        # IMPORTANT: capture shell stderr too (syntax/command-not-found/etc)
+        # capture shell stderr too
         loop_cmd = (
             f'exec 2>>"{AUDIO_ERR_LOG}"; '
             f'while true; do {play_cmd} 1>/dev/null; done'
@@ -291,17 +271,21 @@ class NoiseModule:
         self._stop = False
         self._fatal: Optional[str] = None
 
+        self.page = "main"  # main | noise_menu_cycle | noise_menu_scroll | fatal
+
         self.noise_idx = 0
         self.noise_type = NOISE_TYPES[self.noise_idx]
 
-        self.pulse_idx = 1  # default 200ms
+        self.pulse_idx = 1  # 200ms
         self.pulse_ms = PULSE_OPTIONS_MS[self.pulse_idx]
 
-        self.volume = 70
         self.playing = False
 
         self.cursor_idx = 0
         self.cursor = ROWS[self.cursor_idx]
+
+        # menu selection index (for scroll menu)
+        self.menu_noise_idx = self.noise_idx
 
         self._stdin_buf = b""
         self._last_state_emit = 0.0
@@ -311,15 +295,18 @@ class NoiseModule:
 
     def hello(self) -> None:
         _emit({"type": "hello", "module": MODULE_NAME, "version": MODULE_VERSION})
-        _emit({"type": "page", "name": "main"})
+        _emit({"type": "page", "name": self.page})
         self.emit_state(force=True)
 
-    def toast(self, msg: str) -> None:
-        _emit({"type": "toast", "message": str(msg)[:160]})
+    def set_page(self, name: str) -> None:
+        self.page = name
+        _emit({"type": "page", "name": self.page})
+        self.emit_state(force=True)
 
     def fatal(self, msg: str) -> None:
         self._fatal = str(msg)[:220]
         _emit({"type": "fatal", "message": self._fatal})
+        self.set_page("fatal")
 
     def emit_state(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -329,11 +316,12 @@ class NoiseModule:
         _emit({
             "type": "state",
             "ready": (self._fatal is None),
+            "page": self.page,
             "noise_type": self.noise_type,
             "pulse_ms": int(self.pulse_ms),
-            "volume": int(self.volume),
             "playing": bool(self.playing),
-            "cursor": self.cursor,  # noise|rate|volume|play
+            "cursor": self.cursor,             # main page cursor: noise|rate|play
+            "menu_noise_idx": int(self.menu_noise_idx),  # for noise_menu_scroll rendering
         })
 
     def _write_pattern(self) -> None:
@@ -341,13 +329,13 @@ class NoiseModule:
         pulse_n = max(1, int(SAMPLE_RATE * (self.pulse_ms / 1000.0)))
         on_n = max(1, int(pulse_n * PULSE_DUTY))
 
-        rng = random.Random(0x515745 + self.volume * 17 + (NOISE_TYPES.index(self.noise_type) * 1337))
-        mono = [0.0] * total_n
+        # seed stable per noise_type + pulse_ms so changing selections changes texture
+        rng = random.Random(0x515745 + (NOISE_TYPES.index(self.noise_type) * 1337) + (self.pulse_ms * 17))
 
+        mono = [0.0] * total_n
         i = 0
         while i < total_n:
             n = min(on_n, total_n - i)
-
             if self.noise_type == "white":
                 seg = _gen_white(n, rng)
             elif self.noise_type == "pink":
@@ -359,8 +347,8 @@ class NoiseModule:
             seg = _apply_fade(seg, fade_ms=8)
 
             mono[i:i+n] = seg
-            i += pulse_n  # leaves silence between pulses
-        _write_wav(self._pattern_path, mono, self.volume)
+            i += pulse_n  # silence between pulses
+        _write_wav(self._pattern_path, mono)
 
     def _start_audio(self) -> None:
         if self.playing:
@@ -381,40 +369,111 @@ class NoiseModule:
         self._stop_audio()
         self._start_audio()
 
-    # Navigation (Up/Down)
     def _move_cursor(self, delta: int) -> None:
         self.cursor_idx = (self.cursor_idx + delta) % len(ROWS)
         self.cursor = ROWS[self.cursor_idx]
         self.emit_state(force=True)
 
-    # Activation (Select / Select_hold)
-    def _next_noise(self, delta: int) -> None:
-        self.noise_idx = (self.noise_idx + delta) % len(NOISE_TYPES)
-        self.noise_type = NOISE_TYPES[self.noise_idx]
-        self.toast(f"Noise Type: {NOISE_LABEL.get(self.noise_type, self.noise_type.title())}")
-        self._restart_if_playing()
-
-    def _next_rate(self, delta: int) -> None:
+    def _cycle_rate(self, delta: int) -> None:
         self.pulse_idx = (self.pulse_idx + delta) % len(PULSE_OPTIONS_MS)
         self.pulse_ms = PULSE_OPTIONS_MS[self.pulse_idx]
-        self.toast(f"Sweep Rate: {self.pulse_ms}ms")
         self._restart_if_playing()
+        self.emit_state(force=True)
 
-    def _change_volume(self, delta: int) -> None:
-        self.volume = _clamp(self.volume + delta, 0, 100)
-        self.toast(f"Volume: {self.volume}%")
+    def _apply_noise_idx(self, idx: int) -> None:
+        self.noise_idx = idx % len(NOISE_TYPES)
+        self.noise_type = NOISE_TYPES[self.noise_idx]
+        self.menu_noise_idx = self.noise_idx
         self._restart_if_playing()
+        self.emit_state(force=True)
 
-    def _toggle_play(self) -> None:
-        if self.playing:
+    # ---- Page handlers ----
+
+    def open_noise_menu_cycle(self) -> None:
+        # live-apply cycling with select; no up/down
+        self.menu_noise_idx = self.noise_idx
+        self.set_page("noise_menu_cycle")
+
+    def open_noise_menu_scroll(self) -> None:
+        # up/down scroll; select confirm; back cancel
+        self.menu_noise_idx = self.noise_idx
+        self.set_page("noise_menu_scroll")
+
+    def handle_main(self, cmd: str) -> None:
+        if cmd == "up":
+            self._move_cursor(-1)
+            return
+        if cmd == "down":
+            self._move_cursor(+1)
+            return
+
+        if cmd == "select":
+            if self.cursor == "noise":
+                self.open_noise_menu_cycle()
+                return
+            if self.cursor == "rate":
+                self._cycle_rate(+1)
+                return
+            # play
+            if self.playing:
+                self._stop_audio()
+            else:
+                self._start_audio()
+            self.emit_state(force=True)
+            return
+
+        if cmd == "select_hold":
+            if self.cursor == "noise":
+                self.open_noise_menu_scroll()
+                return
+            if self.cursor == "rate":
+                self._cycle_rate(-1)
+                return
+            # play row hold = stop
             self._stop_audio()
-            self.toast("STOP")
-        else:
-            self._start_audio()
-            self.toast("PLAY")
+            self.emit_state(force=True)
+            return
+
+    def handle_noise_menu_cycle(self, cmd: str) -> None:
+        # select cycles & applies immediately; back returns to main; hold = open scroll menu
+        if cmd == "select":
+            self._apply_noise_idx(self.noise_idx + 1)
+            return
+        if cmd == "select_hold":
+            # user requested hold = open menu scrollable; allow switching without leaving menu layer
+            self.open_noise_menu_scroll()
+            return
+        if cmd == "back":
+            self.set_page("main")
+            return
+        # ignore up/down in cycle menu to prevent accidental navigation
+
+    def handle_noise_menu_scroll(self, cmd: str) -> None:
+        if cmd == "up":
+            self.menu_noise_idx = (self.menu_noise_idx - 1) % len(NOISE_TYPES)
+            self.emit_state(force=True)
+            return
+        if cmd == "down":
+            self.menu_noise_idx = (self.menu_noise_idx + 1) % len(NOISE_TYPES)
+            self.emit_state(force=True)
+            return
+        if cmd == "select":
+            self._apply_noise_idx(self.menu_noise_idx)
+            self.set_page("main")
+            return
+        if cmd == "back":
+            # cancel
+            self.menu_noise_idx = self.noise_idx
+            self.set_page("main")
+            return
+        if cmd == "select_hold":
+            # quick cancel back to main
+            self.menu_noise_idx = self.noise_idx
+            self.set_page("main")
+            return
 
     def handle(self, cmd: str) -> None:
-        if cmd == "back":
+        if cmd == "back" and self.page == "main":
             try:
                 self._stop_audio()
             except Exception:
@@ -423,45 +482,26 @@ class NoiseModule:
             _emit({"type": "exit"})
             return
 
-        if self._fatal is not None:
+        if self._fatal is not None and cmd != "back":
             return
 
         try:
-            if cmd == "up":
-                self._move_cursor(-1)
-                return
-            if cmd == "down":
-                self._move_cursor(+1)
-                return
-
-            if cmd == "select":
-                if self.cursor == "noise":
-                    self._next_noise(+1)
-                elif self.cursor == "rate":
-                    self._next_rate(+1)
-                elif self.cursor == "volume":
-                    self._change_volume(+5)
-                else:  # play
-                    self._toggle_play()
-                self.emit_state(force=True)
-                return
-
-            if cmd == "select_hold":
-                if self.cursor == "noise":
-                    self._next_noise(-1)
-                elif self.cursor == "rate":
-                    self._next_rate(-1)
-                elif self.cursor == "volume":
-                    self._change_volume(-5)
-                else:  # play
-                    self._stop_audio()
-                    self.toast("STOP")
-                self.emit_state(force=True)
-                return
-
+            if self.page == "main":
+                self.handle_main(cmd)
+            elif self.page == "noise_menu_cycle":
+                self.handle_noise_menu_cycle(cmd)
+            elif self.page == "noise_menu_scroll":
+                self.handle_noise_menu_scroll(cmd)
+            elif self.page == "fatal":
+                if cmd == "back":
+                    try:
+                        self._stop_audio()
+                    except Exception:
+                        pass
+                    self._stop = True
+                    _emit({"type": "exit"})
         except Exception as e:
             self.fatal(_safe_err(e))
-            self.emit_state(force=True)
 
     def _read_stdin(self) -> None:
         try:
@@ -488,7 +528,6 @@ class NoiseModule:
 
     def run(self) -> int:
         self.hello()
-
         while not self._stop:
             try:
                 events = self.sel.select(timeout=TICK_S)
@@ -496,22 +535,19 @@ class NoiseModule:
                     if (mask & selectors.EVENT_READ) and key.fileobj == self.stdin_fd:
                         self._read_stdin()
 
-                # Audio watchdog/recover
+                # watchdog audio
                 if self.playing and self.audio.died():
                     reason = self.audio.died_reason()
                     self.playing = False
-
                     recovered = False
                     for _ in range(3):
                         try:
                             time.sleep(0.15)
                             self._start_audio()
                             recovered = True
-                            self.toast("Audio recovered")
                             break
                         except Exception:
                             recovered = False
-
                     if not recovered:
                         self.fatal(f"Audio playback stopped ({reason})")
                     self.emit_state(force=True)
@@ -521,7 +557,6 @@ class NoiseModule:
             except Exception as e:
                 self.fatal(_safe_err(e))
                 self.emit_state(force=True)
-
         return 0
 
 

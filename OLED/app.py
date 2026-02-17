@@ -874,16 +874,14 @@ def run_module(mod: Module, consume, clear) -> None:
             oled_hard_wake()
             return
 
-        state: Dict[str, Any] = {
+        state = {
             "page": "main",
             "ready": False,
             "noise_type": "white",
             "pulse_ms": 200,
-            "volume": 70,
             "playing": False,
-            "cursor": "noise",   # noise|rate|volume|play
-            "toast": "",
-            "toast_until": 0.0,
+            "cursor": "noise",        # main: noise|rate|play
+            "menu_noise_idx": 0,      # menu highlight
             "fatal": "",
         }
 
@@ -898,49 +896,50 @@ def run_module(mod: Module, consume, clear) -> None:
 
         def draw_main() -> None:
             noise_raw = str(state.get("noise_type") or "white").strip().lower()
-            if noise_raw == "white":
-                noise_disp = "White"
-            elif noise_raw == "pink":
-                noise_disp = "Pink"
-            elif noise_raw == "brown":
-                noise_disp = "Brown"
-            else:
-                noise_disp = (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
-
+            noise_disp = {"white":"White","pink":"Pink","brown":"Brown"}.get(
+                noise_raw, (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
+            )
             pulse_ms = int(state.get("pulse_ms") or 200)
-            vol = int(state.get("volume") or 0)
-            vol = max(0, min(100, vol))
             playing = bool(state.get("playing"))
             cursor = str(state.get("cursor") or "noise")
 
             items = [
-                ("noise",  f"Noise Type: {noise_disp}"),
-                ("rate",   f"Sweep Rate: {pulse_ms}ms"),
-                ("volume", f"Volume:     {vol}%"),
-                ("play",   f"Play:       {'STOP' if playing else 'PLAY'}"),
+                ("noise", f"Noise Type: {noise_disp}"),
+                ("rate",  f"Sweep Rate: {pulse_ms}ms"),
+                ("play",  f"Play:       {'STOP' if playing else 'PLAY'}"),
             ]
 
-            # Window: title + 3 lines. Show 3 at a time; shift when cursor is on 4th row.
-            idx = 0
-            for i, (k, _) in enumerate(items):
-                if k == cursor:
-                    idx = i
-                    break
-            start = 0 if idx < 3 else 1
-            view = items[start:start + 3]
-
             lines = []
-            for k, text in view:
+            for k, text in items:
                 prefix = ">" if k == cursor else " "
                 lines.append((prefix + text)[:21])
 
-            # Toast overlay without double-drawing (prevents “flashing other lines”)
-            t = toast_active()
-            if t:
-                lines[2] = t[:21]
+            oled_message("Noise Generator", lines, "SEL=Act HOLD=Alt BACK=Exit")
 
-            footer = "UP/DN=Move SEL=Set"
-            oled_message("Noise Generator", lines, footer)
+        def draw_noise_menu_cycle() -> None:
+            noise_raw = str(state.get("noise_type") or "white").strip().lower()
+            noise_disp = {"white":"White","pink":"Pink","brown":"Brown"}.get(
+                noise_raw, (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
+            )
+            lines = [
+                ("> " + f"{noise_disp}")[:21],
+                "  SEL=Next/Apply"[:21],
+                "  HOLD=Scroll"[:21],
+            ]
+            oled_message("Noise Types", lines, "BACK=Done")
+
+        def draw_noise_menu_scroll() -> None:
+            types = ["White", "Pink", "Brown"]
+            idx = int(state.get("menu_noise_idx") or 0) % len(types)
+
+            # show a 3-line list centered around idx when possible
+            # since we only have 3 items today, show all
+            lines = []
+            for i, name in enumerate(types):
+                prefix = ">" if i == idx else " "
+                lines.append((prefix + name)[:21])
+
+            oled_message("Noise Types", lines, "SEL=Choose BACK=Cancel")
 
         def draw_fatal() -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]
@@ -961,9 +960,10 @@ def run_module(mod: Module, consume, clear) -> None:
                     state["page"] = msg.get("name", state.get("page", "main"))
 
                 elif t == "state":
-                    # Match keys emitted by noise_generator/run.py
                     if "ready" in msg:
                         state["ready"] = bool(msg.get("ready"))
+                    if "page" in msg:
+                        state["page"] = str(msg.get("page") or state.get("page") or "main")
                     if "noise_type" in msg:
                         state["noise_type"] = str(msg.get("noise_type") or state.get("noise_type") or "white")
                     if "pulse_ms" in msg:
@@ -971,15 +971,15 @@ def run_module(mod: Module, consume, clear) -> None:
                             state["pulse_ms"] = int(msg.get("pulse_ms"))
                         except Exception:
                             pass
-                    if "volume" in msg:
-                        try:
-                            state["volume"] = int(msg.get("volume"))
-                        except Exception:
-                            pass
                     if "playing" in msg:
                         state["playing"] = bool(msg.get("playing"))
                     if "cursor" in msg:
                         state["cursor"] = str(msg.get("cursor") or state.get("cursor") or "noise")
+                    if "menu_noise_idx" in msg:
+                        try:
+                            state["menu_noise_idx"] = int(msg.get("menu_noise_idx"))
+                        except Exception:
+                            pass
 
                 elif t == "toast":
                     txt = str(msg.get("message") or "")[:21]
