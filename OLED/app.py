@@ -822,37 +822,217 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
-    # -----------------------------
-    # UAP Caller JSON UI path (unchanged)
-    # -----------------------------
-    if is_uap:
-        pump = None
-        try:
-            if proc.stdout is None:
-                raise RuntimeError("uap_caller requires stdout=PIPE")
-            pump = StdoutJSONPump(proc.stdout, log)
-        except Exception as e:
-            log(f"[launcher] pump_init_failed: {e!r}")
-            oled_message("UAP Caller", ["Pump init failed", str(e)[:21], ""], "BACK")
-            try:
-                proc.terminate()
-            except Exception:
+        # -----------------------------
+        # UAP Caller JSON UI path
+        # -----------------------------
+        # UI state (fed by child JSON)
+        state: Dict[str, Any] = {
+            "page": "build",          # build|playback|fatal
+            "build_pct": 0.0,
+            "build_step": "",
+            "playing": False,
+            "elapsed_s": 0,
+            "fatal": "",
+        }
+
+        last_msg_time = time.time()
+        last_draw_time = 0.0
+
+        def draw_build() -> None:
+            pct = float(state.get("build_pct") or 0.0)
+            step = str(state.get("build_step") or "")[:21]
+            oled_message("UAP Call Sig", [step, f"{int(pct*100):3d}%"], "Loading…")
+
+        def draw_playback() -> None:
+            mm, ss = divmod(int(state.get("elapsed_s") or 0), 60)
+            playing = bool(state.get("playing"))
+            st = "PLAYING" if playing else "READY"
+            oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
+
+        def apply_msg(msg: Dict[str, Any]) -> None:
+            t = msg.get("type")
+            if t == "page":
+                name = str(msg.get("name") or state["page"])
+                state["page"] = name
+            elif t == "build":
+                state["page"] = "build"
+                state["build_pct"] = float(msg.get("pct", state["build_pct"]) or 0.0)
+                state["build_step"] = str(msg.get("step", state["build_step"]) or "")
+                # optional, if your child sends it:
+                if "elapsed_s" in msg:
+                    state["elapsed_s"] = int(msg.get("elapsed_s") or 0)
+            elif t == "state":
+                state["page"] = "playback"
+                state["playing"] = bool(msg.get("playing", state["playing"]))
+                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]) or 0)
+            elif t == "fatal":
+                state["page"] = "fatal"
+                state["fatal"] = str(msg.get("message") or "fatal")[:21]
+            elif t == "exit":
+                # child intends to exit; loop will break when proc.poll() changes
                 pass
-            time.sleep(1.0)
-            oled_hard_wake()
-            return
 
-        # (keep your existing uap loop exactly as-is)
-        # ... your current uap loop here ...
-        # NOTE: leaving out for brevity is NOT allowed, so paste your existing
-        # uap block unchanged from your file.
+        # Main loop while module is alive
+        while proc.poll() is None:
+            # 1) Pump child stdout (non-blocking)
+            msgs = pump.pump(max_bytes=65536, max_lines=50)
+            if msgs:
+                last_msg_time = time.time()
+                for m in msgs:
+                    apply_msg(m)
 
-        # Cleanup pump/stdout
-        try:
-            if pump:
-                pump.close()
-        except Exception:
-            pass
+            # 2) Draw (throttle a bit)
+            now = time.time()
+            if now - last_draw_time >= 0.10:
+                if state.get("page") == "build":
+                    draw_build()
+                elif state.get("page") == "fatal":
+                    oled_message("UAP Caller", ["ERROR", state.get("fatal","")], "BACK")
+                else:
+                    draw_playback()
+                last_draw_time = now
+
+            # 3) Forward buttons (HOLD FIRST)
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+
+            if consume("select_hold"):
+                send("select_hold")
+                consume("select")  # discard any queued short-press from same physical press
+            elif consume("select"):
+                send("select")
+
+            if consume("back"):
+                send("back")
+                for _ in range(50):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            # 4) Watchdog: if child goes silent too long, fail safe
+            if (time.time() - last_msg_time) > 20.0:
+                log("[launcher] watchdog: uap_caller silent >20s; terminating")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            time.sleep(0.02)
+
+# -----------------------------
+        # UAP Caller JSON UI path
+        # -----------------------------
+        # UI state (fed by child JSON)
+        state: Dict[str, Any] = {
+            "page": "build",          # build|playback|fatal
+            "build_pct": 0.0,
+            "build_step": "",
+            "playing": False,
+            "elapsed_s": 0,
+            "fatal": "",
+        }
+
+        last_msg_time = time.time()
+        last_draw_time = 0.0
+
+        def draw_build() -> None:
+            pct = float(state.get("build_pct") or 0.0)
+            step = str(state.get("build_step") or "")[:21]
+            oled_message("UAP Call Sig", [step, f"{int(pct*100):3d}%"], "Loading…")
+
+        def draw_playback() -> None:
+            mm, ss = divmod(int(state.get("elapsed_s") or 0), 60)
+            playing = bool(state.get("playing"))
+            st = "PLAYING" if playing else "READY"
+            oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
+
+        def apply_msg(msg: Dict[str, Any]) -> None:
+            t = msg.get("type")
+            if t == "page":
+                name = str(msg.get("name") or state["page"])
+                state["page"] = name
+            elif t == "build":
+                state["page"] = "build"
+                state["build_pct"] = float(msg.get("pct", state["build_pct"]) or 0.0)
+                state["build_step"] = str(msg.get("step", state["build_step"]) or "")
+                # optional, if your child sends it:
+                if "elapsed_s" in msg:
+                    state["elapsed_s"] = int(msg.get("elapsed_s") or 0)
+            elif t == "state":
+                state["page"] = "playback"
+                state["playing"] = bool(msg.get("playing", state["playing"]))
+                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]) or 0)
+            elif t == "fatal":
+                state["page"] = "fatal"
+                state["fatal"] = str(msg.get("message") or "fatal")[:21]
+            elif t == "exit":
+                # child intends to exit; loop will break when proc.poll() changes
+                pass
+
+        # Main loop while module is alive
+        while proc.poll() is None:
+            # 1) Pump child stdout (non-blocking)
+            msgs = pump.pump(max_bytes=65536, max_lines=50)
+            if msgs:
+                last_msg_time = time.time()
+                for m in msgs:
+                    apply_msg(m)
+
+            # 2) Draw (throttle a bit)
+            now = time.time()
+            if now - last_draw_time >= 0.10:
+                if state.get("page") == "build":
+                    draw_build()
+                elif state.get("page") == "fatal":
+                    oled_message("UAP Caller", ["ERROR", state.get("fatal","")], "BACK")
+                else:
+                    draw_playback()
+                last_draw_time = now
+
+            # 3) Forward buttons (HOLD FIRST)
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+
+            if consume("select_hold"):
+                send("select_hold")
+                consume("select")  # discard any queued short-press from same physical press
+            elif consume("select"):
+                send("select")
+
+            if consume("back"):
+                send("back")
+                for _ in range(50):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            # 4) Watchdog: if child goes silent too long, fail safe
+            if (time.time() - last_msg_time) > 20.0:
+                log("[launcher] watchdog: uap_caller silent >20s; terminating")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            time.sleep(0.02)
 
         # -----------------------------
     # Noise Generator JSON UI path
