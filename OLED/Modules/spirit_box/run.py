@@ -186,6 +186,68 @@ class PCMRing:
                 out = out[-want:]
             return bytes(out)
 
+# ---------------- Pulse playback (PipeWire/PulseAudio) ----------------
+class PulsePlayback:
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+        self.ok = False
+
+    def start(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.ok = True
+            return
+        # paplay reads from a file path; /dev/stdin works for piped data
+        cmd = [
+            "paplay",
+            "--raw",
+            "--rate=48000",
+            "--channels=2",
+            "--format=s16le",
+            "/dev/stdin",
+        ]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                close_fds=True,
+            )
+            self.ok = True
+        except Exception:
+            self.proc = None
+            self.ok = False
+
+    def stop(self) -> None:
+        p = self.proc
+        self.proc = None
+        self.ok = False
+        if not p:
+            return
+        try:
+            if p.poll() is None:
+                try:
+                    p.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def write(self, data: bytes) -> None:
+        p = self.proc
+        if not p or p.poll() is not None:
+            self.ok = False
+            return
+        try:
+            p.stdin.write(data)
+        except Exception:
+            self.ok = False
+
 # ---------------- ALSA capture (arecord raw) ----------------
 class ALSACapture:
     def __init__(self):
