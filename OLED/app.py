@@ -1084,7 +1084,7 @@ def run_module(mod: Module, consume, clear) -> None:
         # Tone Generator JSON UI path
         # =====================================================
         elif is_tone:
-            # (unchanged from your file)
+            # (UNCHANGED from your file)
             state: Dict[str, Any] = {
                 "page": "main",
                 "ready": False,
@@ -1314,45 +1314,102 @@ def run_module(mod: Module, consume, clear) -> None:
                 time.sleep(0.02)
 
         # =====================================================
-        # Spirit Box JSON UI path
+        # Spirit Box JSON UI path (UPDATED for clean main + settings)
         # =====================================================
         elif is_spirit:
+            # Backward compatible state: supports old cursor UI and new page/settings UI.
             state: Dict[str, Any] = {
-                "page": "main",
-                "ready": False,
+                # NEW UI keys
+                "page": "main",                 # main|settings|fatal
                 "sweep_ms": 200,
-                "direction": "fwd",
-                "mode": "scan",
+                "mode": "fwd",                  # fwd|bwd|rdm  (new)
+                "settings_cursor": "rate",      # rate|mode    (new)
+                "freq_mhz": 99.5,               # new
                 "playing": False,
-                "cursor": "rate",
+                "ready": False,
+
+                # LEGACY keys (old module)
+                "direction": "fwd",             # fwd|rev
+                "mode_legacy": "scan",          # scan|burst
+                "cursor": "rate",               # rate|direction|mode|play
                 "fatal": "",
             }
 
             last_msg_time = time.time()
             last_draw_time = 0.0
 
-            def _dir_disp() -> str:
+            def _mode_disp_new() -> str:
+                m = str(state.get("mode") or "fwd").lower().strip()
+                return {"fwd": "Fwd", "bwd": "Bwd", "rdm": "Rdm"}.get(m, m[:3].upper() if m else "Fwd")
+
+            def _freq_disp() -> str:
+                f = state.get("freq_mhz", None)
+                try:
+                    return f"{float(f):0.1f} MHz"
+                except Exception:
+                    return "—"
+
+            def draw_main_clean() -> None:
+                sweep_ms = int(state.get("sweep_ms") or 200)
+                playing = bool(state.get("playing"))
+                status_txt = "PLAY" if playing else "STOP"
+                mode_txt = _mode_disp_new()
+                freq_txt = _freq_disp()
+
+                oled_guard()
+                with canvas(device) as draw:
+                    draw.text((0, 0), f"Rate:{sweep_ms}  Mode:{mode_txt}"[:21], fill=255)
+                    draw.line((0, 12, 127, 12), fill=255)
+                    draw.text((0, 16), f"Frequency: {freq_txt}"[:21], fill=255)
+                    draw.text((0, 28), f"Status: {status_txt}"[:21], fill=255)
+                    draw.line((0, 44, 127, 44), fill=255)
+                    draw.text((0, 48), "SEL=Settings HOLD=Play"[:21], fill=255)
+
+            def draw_settings_clean() -> None:
+                sweep_ms = int(state.get("sweep_ms") or 200)
+                mode_txt = _mode_disp_new()
+                cur = str(state.get("settings_cursor") or "rate").lower().strip()
+
+                line_rate = f"Rate: {sweep_ms} ms"
+                line_mode = f"Mode: {mode_txt}"
+
+                if cur == "mode":
+                    l1 = ("  " + line_rate)[:21]
+                    l2 = ("> " + line_mode)[:21]
+                else:
+                    l1 = ("> " + line_rate)[:21]
+                    l2 = ("  " + line_mode)[:21]
+
+                oled_guard()
+                with canvas(device) as draw:
+                    draw.text((0, 0), "Spirit Box Settings"[:21], fill=255)
+                    draw.line((0, 12, 127, 12), fill=255)
+                    draw.text((0, 16), l1, fill=255)
+                    draw.text((0, 28), l2, fill=255)
+                    draw.line((0, 44, 127, 44), fill=255)
+                    draw.text((0, 48), "UP/DN sel SEL/HOLD chg"[:21], fill=255)
+
+            # Legacy draw retained as fallback if new keys never appear
+            def _dir_disp_legacy() -> str:
                 d = str(state.get("direction") or "fwd").lower()
                 return "REV" if d.startswith("r") else "FWD"
 
-            def _mode_disp() -> str:
-                m = str(state.get("mode") or "scan").lower()
+            def _mode_disp_legacy() -> str:
+                m = str(state.get("mode_legacy") or "scan").lower()
                 return "Burst" if m == "burst" else "Scan"
 
-            def draw_main() -> None:
+            def draw_main_legacy() -> None:
                 sweep_ms = int(state.get("sweep_ms") or 200)
                 playing = bool(state.get("playing"))
                 cursor = str(state.get("cursor") or "rate")
 
                 items = [
                     ("rate",      f"Sweep Rate: {sweep_ms} ms"),
-                    ("direction", f"Direction:  {_dir_disp()}"),
-                    ("mode",      f"Mode:       {_mode_disp()}"),
+                    ("direction", f"Direction:  {_dir_disp_legacy()}"),
+                    ("mode",      f"Mode:       {_mode_disp_legacy()}"),
                     ("play",      f"Play:       {'STOP' if playing else 'PLAY'}"),
                 ]
 
-                # only 3 content lines available in oled_message, so we render 3 and use footer hint
-                # show cursor windowed: keep selected line visible
                 keys = [k for (k, _) in items]
                 try:
                     idx = keys.index(cursor)
@@ -1372,6 +1429,9 @@ def run_module(mod: Module, consume, clear) -> None:
                 msg = (str(state.get("fatal") or "Unknown error"))[:21]
                 oled_message("Spirit Box", ["ERROR", msg, ""], "BACK")
 
+            # Track whether child is emitting the new schema
+            saw_new_schema = False
+
             while proc.poll() is None:
                 msgs = pump.pump(max_bytes=65536, max_lines=200)
                 exit_requested = False
@@ -1382,11 +1442,34 @@ def run_module(mod: Module, consume, clear) -> None:
                 for msg in msgs:
                     t = msg.get("type")
                     if t == "page":
-                        state["page"] = str(msg.get("name") or state.get("page") or "main")
+                        # new module uses page main/settings; legacy used page main
+                        name = str(msg.get("name") or state.get("page") or "main")
+                        state["page"] = name
+                        if name in ("main", "settings"):
+                            saw_new_schema = True
+
                     elif t == "state":
-                        for k in ("ready", "page", "sweep_ms", "direction", "mode", "playing", "cursor"):
+                        # detect new schema if it includes settings_cursor or freq_mhz or mode in fwd/bwd/rdm
+                        if "settings_cursor" in msg or "freq_mhz" in msg:
+                            saw_new_schema = True
+                        if "mode" in msg and str(msg.get("mode") or "").lower() in ("fwd", "bwd", "rdm"):
+                            saw_new_schema = True
+
+                        # Apply known keys defensively
+                        for k in ("ready", "page", "sweep_ms", "playing", "freq_mhz", "settings_cursor", "mode"):
                             if k in msg:
                                 state[k] = msg.get(k)
+
+                        # Legacy keys (if legacy module still used)
+                        for k in ("direction", "cursor"):
+                            if k in msg:
+                                state[k] = msg.get(k)
+                        if "mode_legacy" in msg:
+                            state["mode_legacy"] = msg.get("mode_legacy")
+                        # Some older versions used "mode"=scan/burst; capture it as legacy if so:
+                        if "mode" in msg and str(msg.get("mode") or "").lower() in ("scan", "burst"):
+                            state["mode_legacy"] = msg.get("mode")
+
                     elif t == "fatal":
                         state["page"] = "fatal"
                         state["fatal"] = str(msg.get("message", "fatal"))
@@ -1399,7 +1482,15 @@ def run_module(mod: Module, consume, clear) -> None:
                     if pg == "fatal":
                         draw_fatal()
                     else:
-                        draw_main()
+                        # Prefer clean UI when new schema detected
+                        if saw_new_schema:
+                            if pg == "settings":
+                                draw_settings_clean()
+                            else:
+                                draw_main_clean()
+                        else:
+                            draw_main_legacy()
+
                     last_draw_time = now
 
                 if exit_requested:
@@ -1483,8 +1574,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
         # Child may have left OLED off; recover here
         oled_hard_wake()
-
-
 # =====================================================
 # MAIN
 # =====================================================
