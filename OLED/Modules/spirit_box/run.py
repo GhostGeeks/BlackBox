@@ -68,7 +68,7 @@ MODE_CHOICES = ["scan", "burst"]  # burst is future expansion
 CURSOR_CHOICES = ["rate", "direction", "mode", "play"]
 
 # Real capture
-ALSA_DEVICE = "hw:0,0"
+ALSA_DEVICE = "hw:CARD=Device,DEV=0"  # or "hw:2,0"
 CAP_RATE = 48000
 CAP_CHANNELS = 2
 CAP_FORMAT = "S16_LE"
