@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
-"""
-BlackBox Spirit Box (REAL sweep + USB capture + BT playback)
-
-UI behavior (new):
-MAIN page shows:
-  Rate: <ms>     Mode: <Fwd/Bwd/Rdm>
-  Frequency: <current MHz>
-  Status: <PLAY/STOP>
-  Settings:
-
-Controls:
-  MAIN:
-    select       -> open Settings page
-    select_hold  -> toggle PLAY/STOP
-    back         -> exit module
-    up/down      -> no-op (kept clean)
-
-  SETTINGS:
-    up/down      -> move cursor (Rate / Mode)
-    select       -> cycle forward
-    select_hold  -> cycle backward
-    back         -> return to Main
-
-Notes:
-- stdout JSON only
-- debug logs to /tmp/
-- Uses TEA tuner backend (TEA5767 I2C addr 0x60) with stub fallback
-- Capture from USB sound card using ALSA plughw:2,0 @ 48k, S16_LE, 2ch
-- Playback to default Pulse sink (PipeWire), typically BT speaker
-"""
+# ============================================================
+# BlackBox Module: Spirit Box (Real Sweep + Real Capture)
+# Path: /opt/blackbox/OLED/Modules/spirit_box/run.py
+#
+# UI v4:
+#   MAIN:
+#     - display Rate/Mode/Frequency
+#     - selectable: Status and Settings only
+#       up/down -> move selection
+#       select  -> activate (toggle play OR open settings)
+#       select_hold -> toggle play/stop
+#       back -> exit
+#
+#   SETTINGS:
+#     - initial: up/down selects Rate or Mode
+#     - select enters edit for that item
+#     - while editing: up/down changes value
+#     - select again commits and returns to selection mode
+#     - select_hold saves + returns to MAIN
+#     - back returns to MAIN (no special save; values already applied)
+#
+# Audio:
+#   Capture: arecord from USB via ALSA (plughw:2,0)
+#   Playback: paplay raw -> default Pulse sink (PipeWire), typically BT
+# ============================================================
 
 import os
 import sys
@@ -46,41 +41,38 @@ from typing import Optional, List, Deque
 from collections import deque
 
 MODULE_NAME = "spirit_box"
-MODULE_VERSION = "sb_v2_ui_clean"
+MODULE_VERSION = "sb_v4_settings"
 
 MODULE_ERR = "/tmp/blackbox_spirit_module.err"
 AUDIO_ERR  = "/tmp/blackbox_spirit_audio.err"
 SNAP_WAV   = "/tmp/blackbox_spirit_snap.wav"
 
 HEARTBEAT_S = 0.25
-TICK_S = 0.02  # <=50ms tick
+TICK_S = 0.02
 
 # UI choices
 SWEEP_MS_CHOICES = [150, 200, 250, 300]
-MODE_CHOICES = ["fwd", "bwd", "rdm"]          # displayed as Fwd/Bwd/Rdm
-SETTINGS_CURSOR_CHOICES = ["rate", "mode"]   # settings cursor only
+MODE_CHOICES = ["fwd", "bwd", "rdm"]
+MAIN_CURSOR_CHOICES = ["play", "settings"]
+SETTINGS_CURSOR_CHOICES = ["rate", "mode"]
+
+# FM sweep
+FM_MIN = 87.5
+FM_MAX = 108.0
+FM_STEP = 0.2
 
 # Capture (USB)
-# IMPORTANT: use plughw to avoid "Channels count non available" for strict hw:2,0
 ALSA_DEVICE = "plughw:2,0"
 CAP_RATE = 48000
 CAP_CHANNELS = 2
 CAP_FORMAT = "S16_LE"
 SAMPLE_BYTES = 2
 FRAME_BYTES = CAP_CHANNELS * SAMPLE_BYTES
-
 CHUNK_FRAMES = 1024
 CHUNK_BYTES = CHUNK_FRAMES * FRAME_BYTES
-
-RING_SECONDS = 5  # keep last N seconds for snapshots
-
-# Tuner sweep defaults (FM band)
-FM_MIN = 87.5
-FM_MAX = 108.0
-FM_STEP = 0.2  # MHz per step
+RING_SECONDS = 5
 
 
-# ---------------- logging (file only) ----------------
 def _log_err(msg: str) -> None:
     try:
         with open(MODULE_ERR, "a", encoding="utf-8") as f:
@@ -89,7 +81,6 @@ def _log_err(msg: str) -> None:
         pass
 
 
-# ---------------- strict JSON stdout ----------------
 def _emit(obj: dict) -> None:
     try:
         sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
@@ -97,14 +88,15 @@ def _emit(obj: dict) -> None:
     except Exception:
         pass
 
+
 def _toast(msg: str) -> None:
     _emit({"type": "toast", "message": msg})
+
 
 def _fatal(msg: str) -> None:
     _emit({"type": "fatal", "message": msg})
 
 
-# ---------------- stdin reader (non-blocking) ----------------
 class StdinReader:
     def __init__(self) -> None:
         self.fd = sys.stdin.fileno()
@@ -148,17 +140,13 @@ class StdinReader:
             while b"\n" in self.buf:
                 line, _, rest = self.buf.partition(b"\n")
                 self.buf = bytearray(rest)
-                try:
-                    s = line.decode("utf-8", errors="ignore").strip().lower()
-                except Exception:
-                    continue
+                s = line.decode("utf-8", errors="ignore").strip().lower()
                 if s:
                     out.append(s)
 
         return out
 
 
-# ---------------- ring buffer (raw PCM) ----------------
 class PCMRing:
     def __init__(self, max_bytes: int):
         self.max_bytes = max_bytes
@@ -181,7 +169,7 @@ class PCMRing:
                 return b""
             out = bytearray()
             for block in reversed(self.q):
-                out[:0] = block  # prepend
+                out[:0] = block
                 if len(out) >= want:
                     break
             if len(out) > want:
@@ -189,19 +177,13 @@ class PCMRing:
             return bytes(out)
 
 
-# ---------------- Pulse playback (PipeWire/PulseAudio) ----------------
 class PulsePlayback:
-    """
-    Plays raw PCM to the default Pulse sink (PipeWire's PulseAudio server).
-    Your default sink is BT when connected.
-    """
     def __init__(self):
         self.proc: Optional[subprocess.Popen] = None
         self.ok = False
         self._last_start = 0.0
 
     def start(self) -> None:
-        # backoff to avoid tight restart loops
         now = time.monotonic()
         if now - self._last_start < 0.5:
             return
@@ -268,7 +250,6 @@ class PulsePlayback:
             self.ok = False
 
 
-# ---------------- ALSA capture (arecord raw) ----------------
 class ALSACapture:
     def __init__(self):
         self.proc: Optional[subprocess.Popen] = None
@@ -278,12 +259,12 @@ class ALSACapture:
         max_bytes = int(RING_SECONDS * CAP_RATE * FRAME_BYTES)
         self.ring = PCMRing(max_bytes=max_bytes)
 
-        self.level = 0       # 0..100
+        self.level = 0
         self.alsa_ok = False
         self._restart_tries = 0
 
         self.playback = PulsePlayback()
-        self.play_audio = True  # keep BT output on
+        self.play_audio = True
 
     def start(self) -> None:
         if self.t and self.t.is_alive():
@@ -369,7 +350,6 @@ class ALSACapture:
                 self.alsa_ok = True
                 data = out.read(CHUNK_BYTES)
 
-                # USB devices can sometimes take a beat to start streaming
                 if not data:
                     time.sleep(0.05)
                     data = out.read(CHUNK_BYTES)
@@ -413,7 +393,6 @@ class ALSACapture:
 
 
 def _compute_level_fast(pcm: bytes) -> int:
-    # peak meter from int16, stride for low CPU
     if len(pcm) < 4:
         return 0
     peak = 0
@@ -436,26 +415,21 @@ def _write_wav(path: str, pcm: bytes) -> None:
     os.replace(tmp, path)
 
 
-# ---------------- TEA tuner (real impl + stub) ----------------
 class TEATunerBase:
     def probe(self) -> bool:
         return False
     def set_freq_mhz(self, mhz: float) -> bool:
         return False
-    def mute(self, on: bool) -> None:
-        pass
+
 
 class TEATunerStub(TEATunerBase):
     def probe(self) -> bool:
         return False
     def set_freq_mhz(self, mhz: float) -> bool:
-        return True  # pretend success
+        return True
+
 
 class TEA5767I2C(TEATunerBase):
-    """
-    TEA5767 FM tuner is commonly I2C addr 0x60.
-    Uses /dev/i2c-1. If your tuner differs, keep this interface and swap backend.
-    """
     def __init__(self, bus: int = 1, addr: int = 0x60):
         self.bus = bus
         self.addr = addr
@@ -483,7 +457,6 @@ class TEA5767I2C(TEATunerBase):
             b2 = 0xB0
             b3 = 0x10
             b4 = 0x00
-
             os.write(self.fd, bytes([b0, b1, b2, b3, b4]))
             return True
         except Exception as e:
@@ -508,26 +481,31 @@ class TEA5767I2C(TEATunerBase):
         self.fd = None
 
 
-# ---------------- state ----------------
 @dataclass
 class UIState:
-    page: str = "main"
+    page: str = "main"                 # main|settings
     ready: bool = False
 
     sweep_ms: int = 200
-    mode: str = "fwd"  # fwd/bwd/rdm
+    mode: str = "fwd"                  # fwd|bwd|rdm
+    freq_mhz: float = 99.5
+
     playing: bool = False
 
-    settings_cursor: str = "rate"
+    main_cursor: str = "play"          # play|settings
 
-    freq_mhz: float = 99.5
+    settings_cursor: str = "rate"      # rate|mode
+    settings_edit: bool = False        # False = selecting item, True = editing value
+
     level: int = 0
     tea_ok: bool = False
     alsa_ok: bool = False
 
     _last_toast_t: float = 0.0
     _fatal_active: bool = False
-    _last_step_t: float = 0.0
+
+    # sweep scheduler
+    _next_step_t: float = 0.0
 
 
 def _emit_page(st: UIState) -> None:
@@ -542,17 +520,20 @@ def _emit_state(st: UIState) -> None:
 
         "sweep_ms": int(st.sweep_ms),
         "mode": str(st.mode),
-        "playing": bool(st.playing),
-        "settings_cursor": str(st.settings_cursor),
-
         "freq_mhz": round(float(st.freq_mhz), 1),
+        "playing": bool(st.playing),
+
+        "main_cursor": str(st.main_cursor),
+        "settings_cursor": str(st.settings_cursor),
+        "settings_edit": bool(st.settings_edit),
+
         "level": int(st.level),
         "tea_ok": bool(st.tea_ok),
         "alsa_ok": bool(st.alsa_ok),
     })
 
 
-def _toast_throttle(st: UIState, msg: str, min_interval_s: float = 0.10) -> None:
+def _toast_throttle(st: UIState, msg: str, min_interval_s: float = 0.12) -> None:
     now = time.monotonic()
     if now - st._last_toast_t >= min_interval_s:
         st._last_toast_t = now
@@ -565,8 +546,7 @@ def _cycle_choice(cur: str, choices: List[str], delta: int) -> str:
         idx = choices.index(cur)
     except Exception:
         idx = 0
-    idx = (idx + delta) % len(choices)
-    return choices[idx]
+    return choices[(idx + delta) % len(choices)]
 
 
 def _cycle_int_choice(cur: int, choices: List[int], delta: int) -> int:
@@ -574,12 +554,7 @@ def _cycle_int_choice(cur: int, choices: List[int], delta: int) -> int:
         idx = choices.index(int(cur))
     except Exception:
         idx = 0
-    idx = (idx + delta) % len(choices)
-    return int(choices[idx])
-
-
-def _mode_label(mode: str) -> str:
-    return {"fwd": "Fwd", "bwd": "Bwd", "rdm": "Rdm"}.get(mode, mode)
+    return int(choices[(idx + delta) % len(choices)])
 
 
 def _step_freq(freq: float, mode: str) -> float:
@@ -588,14 +563,11 @@ def _step_freq(freq: float, mode: str) -> float:
         i = random.randint(0, steps)
         f = FM_MIN + i * FM_STEP
         return round(f, 1)
-
     if mode == "bwd":
         f = freq - FM_STEP
         if f < FM_MIN:
             f = FM_MAX
         return f
-
-    # default fwd
     f = freq + FM_STEP
     if f > FM_MAX:
         f = FM_MIN
@@ -620,15 +592,14 @@ def main() -> int:
     _emit({"type": "hello", "module": MODULE_NAME, "version": MODULE_VERSION})
     _emit_page(st)
 
-    # -------- initialize tuner backend --------
+    # Init tuner
     tuner: TEATunerBase = TEA5767I2C(bus=1, addr=0x60)
     st.tea_ok = tuner.probe()
     if not st.tea_ok:
         tuner = TEATunerStub()
-        st.tea_ok = False
         _log_err("TEA probe failed; using stub backend")
 
-    # -------- initialize capture --------
+    # Init capture
     cap = ALSACapture()
 
     st.ready = True
@@ -643,13 +614,34 @@ def main() -> int:
             cap.start()
         except Exception as e:
             _log_err(f"cap_start_exc: {e!r}")
-        time.sleep(0.02)
 
     def stop_real() -> None:
         try:
             cap.stop()
         except Exception:
             pass
+
+    def _schedule_next_step(now: float) -> None:
+        interval = max(10, int(st.sweep_ms)) / 1000.0
+        st._next_step_t = now + interval
+
+    def toggle_play() -> None:
+        if st.playing:
+            st.playing = False
+            _emit_state(st)
+            stop_real()
+            _toast_throttle(st, "STOP")
+        else:
+            st.playing = True
+            _schedule_next_step(time.monotonic())
+            _emit_state(st)
+            start_real()
+            if not cap.t or not cap.t.is_alive():
+                st.playing = False
+                _emit_state(st)
+                _fatal("ALSA capture failed to start (arecord)")
+            else:
+                _toast_throttle(st, "PLAY")
 
     last_hb = 0.0
     last_tick = time.monotonic()
@@ -658,102 +650,107 @@ def main() -> int:
         while not exiting["flag"]:
             now = time.monotonic()
 
-            # ---------- process stdin ----------
+            # ----------------------------
+            # Commands
+            # ----------------------------
             cmds = reader.read_commands()
             for cmd in cmds:
                 if cmd == "back":
                     if st.page == "settings":
                         st.page = "main"
+                        st.settings_edit = False
                         _emit_page(st)
                         _emit_state(st)
                     else:
                         exiting["flag"] = True
                     continue
 
-                # ---------- MAIN page controls ----------
                 if st.page == "main":
-                    if cmd == "select":
-                        st.page = "settings"
-                        _emit_page(st)
+                    if cmd == "select_hold":
+                        toggle_play()
+                        continue
+
+                    if cmd in ("up", "down"):
+                        delta = -1 if cmd == "up" else +1
+                        st.main_cursor = _cycle_choice(st.main_cursor, MAIN_CURSOR_CHOICES, delta)
                         _emit_state(st)
                         continue
 
-                    if cmd == "select_hold":
-                        if st.page == "settings":
-                            # settings are applied immediately; treat hold as "Save & Return"
-                            st.page = "main"
+                    if cmd == "select":
+                        if st.main_cursor == "play":
+                            toggle_play()
+                        else:
+                            st.page = "settings"
+                            st.settings_edit = False
                             _emit_page(st)
                             _emit_state(st)
-                            _toast_throttle(st, "Saved")
-                        else:
-                            toggle_play()
-                        continue
-                        else:
-                            st.playing = True
-                            st._last_step_t = 0.0
-                            _emit_state(st)
-                            start_real()
-
-                            if not cap.t or not cap.t.is_alive():
-                                st.playing = False
-                                _emit_state(st)
-                                _fatal("ALSA capture failed to start (arecord)")
-                            else:
-                                _toast_throttle(st, "PLAY")
                         continue
 
-                    # keep main page clean
                     continue
 
-                # ---------- SETTINGS page controls ----------
+                # SETTINGS page
                 if st.page == "settings":
-                    if cmd == "up":
-                        try:
-                            idx = SETTINGS_CURSOR_CHOICES.index(st.settings_cursor)
-                        except Exception:
-                            idx = 0
-                        st.settings_cursor = SETTINGS_CURSOR_CHOICES[(idx - 1) % len(SETTINGS_CURSOR_CHOICES)]
+                    if cmd == "select_hold":
+                        # Save (settings are already applied), return to MAIN
+                        st.page = "main"
+                        st.settings_edit = False
+                        _emit_page(st)
+                        _emit_state(st)
+                        _toast_throttle(st, "Saved")
+                        continue
+
+                    if cmd == "select":
+                        # enter/exit edit mode
+                        st.settings_edit = not st.settings_edit
                         _emit_state(st)
                         continue
 
-                    if cmd == "down":
-                        try:
-                            idx = SETTINGS_CURSOR_CHOICES.index(st.settings_cursor)
-                        except Exception:
-                            idx = 0
-                        st.settings_cursor = SETTINGS_CURSOR_CHOICES[(idx + 1) % len(SETTINGS_CURSOR_CHOICES)]
-                        _emit_state(st)
+                    if cmd in ("up", "down"):
+                        if not st.settings_edit:
+                            # navigate between rate/mode
+                            delta = -1 if cmd == "up" else +1
+                            st.settings_cursor = _cycle_choice(st.settings_cursor, SETTINGS_CURSOR_CHOICES, delta)
+                            _emit_state(st)
+                        else:
+                            # edit selected value
+                            delta = +1 if cmd == "up" else -1
+                            if st.settings_cursor == "rate":
+                                st.sweep_ms = _cycle_int_choice(st.sweep_ms, SWEEP_MS_CHOICES, delta)
+                                _toast_throttle(st, f"Rate: {st.sweep_ms}ms")
+                                # keep scheduler accurate if currently playing
+                                if st.playing:
+                                    _schedule_next_step(time.monotonic())
+                                _emit_state(st)
+                            else:
+                                st.mode = _cycle_choice(st.mode, MODE_CHOICES, delta)
+                                _toast_throttle(st, f"Mode: {st.mode.upper()}")
+                                _emit_state(st)
                         continue
 
-                    if cmd in ("select", "select_hold"):
-                        delta = +1 if cmd == "select" else -1
+                    continue
 
-                        if st.settings_cursor == "rate":
-                            st.sweep_ms = _cycle_int_choice(st.sweep_ms, SWEEP_MS_CHOICES, delta)
-                            _toast_throttle(st, f"Rate: {st.sweep_ms}ms")
-                            _emit_state(st)
-                            continue
-
-                        if st.settings_cursor == "mode":
-                            st.mode = _cycle_choice(st.mode, MODE_CHOICES, delta)
-                            _toast_throttle(st, f"Mode: {_mode_label(st.mode)}")
-                            _emit_state(st)
-                            continue
-
-                        continue
-
-            # ---------- sweep timing + state refresh ----------
+            # ----------------------------
+            # Sweep + meters
+            # ----------------------------
             st.level = int(cap.level)
             st.alsa_ok = bool(cap.alsa_ok)
 
             if st.playing:
-                if (now - st._last_step_t) >= (st.sweep_ms / 1000.0):
-                    st._last_step_t = now
+                interval = max(10, int(st.sweep_ms)) / 1000.0
+                # if schedule not set, set it
+                if st._next_step_t <= 0.0:
+                    st._next_step_t = now + interval
+
+                # step as many times as needed if loop lags (prevents drift)
+                stepped = 0
+                while st.playing and now >= st._next_step_t and stepped < 4:
                     st.freq_mhz = _step_freq(st.freq_mhz, st.mode)
                     try:
                         tuner.set_freq_mhz(st.freq_mhz)
                     except Exception as e:
                         _log_err(f"tune_exc: {e!r}")
+                    st._next_step_t += interval
+                    stepped += 1
 
                 if cap.t and (not cap.t.is_alive()) and not st._fatal_active:
                     st._fatal_active = True
@@ -762,12 +759,10 @@ def main() -> int:
                     _emit_state(st)
                     _fatal("ALSA capture crashed repeatedly")
 
-            # ---------- heartbeat ----------
             if (now - last_hb) >= HEARTBEAT_S:
                 _emit_state(st)
                 last_hb = now
 
-            # ---------- tick pacing ----------
             elapsed = now - last_tick
             last_tick = now
             if elapsed < TICK_S:
