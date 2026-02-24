@@ -1387,7 +1387,7 @@ def run_module(mod: Module, consume, clear) -> None:
                     draw.text((0, 16), l1, fill=255)
                     draw.text((0, 28), l2, fill=255)
                     draw.line((0, 44, 127, 44), fill=255)
-                    draw.text((0, 48), "UP/DN sel SEL/HOLD chg"[:21], fill=255)
+                    draw.text((0, 48), "HOLD=Save BACK=Main"[:21], fill=255)
 
             # Legacy draw retained as fallback if new keys never appear
             def _dir_disp_legacy() -> str:

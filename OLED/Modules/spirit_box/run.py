@@ -679,12 +679,15 @@ def main() -> int:
                         continue
 
                     if cmd == "select_hold":
-                        # toggle play/stop
-                        if st.playing:
-                            st.playing = False
+                        if st.page == "settings":
+                            # settings are applied immediately; treat hold as "Save & Return"
+                            st.page = "main"
+                            _emit_page(st)
                             _emit_state(st)
-                            stop_real()
-                            _toast_throttle(st, "STOP")
+                            _toast_throttle(st, "Saved")
+                        else:
+                            toggle_play()
+                        continue
                         else:
                             st.playing = True
                             st._last_step_t = 0.0
